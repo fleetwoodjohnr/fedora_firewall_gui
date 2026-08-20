@@ -106,6 +106,12 @@ install_update_timer() {
         return
     fi
 
+    if ! systemctl --user list-units >/dev/null 2>&1; then
+        echo "warning: no systemd user session available — skipping auto-update timer setup" >&2
+        echo "  (log into a graphical/user session and re-run install.sh to enable it)" >&2
+        return
+    fi
+
     mkdir -p "$SYSTEMD_USER_DIR"
     sed "s#@SRC_DIR@#$src_dir#g" \
         "$src_dir/packaging/systemd/firewall-gui-update.service.in" \
@@ -113,8 +119,10 @@ install_update_timer() {
     cp "$src_dir/packaging/systemd/firewall-gui-update.timer" \
         "$SYSTEMD_USER_DIR/firewall-gui-update.timer"
 
-    systemctl --user daemon-reload
-    systemctl --user enable --now firewall-gui-update.timer
+    if ! systemctl --user daemon-reload || ! systemctl --user enable --now firewall-gui-update.timer; then
+        echo "warning: failed to enable the auto-update timer — you can retry later with:" >&2
+        echo "  systemctl --user daemon-reload && systemctl --user enable --now firewall-gui-update.timer" >&2
+    fi
 }
 
 print_summary() {
@@ -125,7 +133,7 @@ print_summary() {
     echo "  Icon:          $ICON_DIR/org.jrf.FirewallGui.svg"
     echo "  App source:    $SHARE_DIR/firewall_gui"
     echo "  Checkout:      $src_dir"
-    if [[ -z "${FIREWALL_GUI_NO_TIMER:-}" ]] && require_cmd systemctl; then
+    if require_cmd systemctl && systemctl --user is-enabled --quiet firewall-gui-update.timer 2>/dev/null; then
         echo "  Auto-update:   checks for updates every 30 minutes (systemctl --user status firewall-gui-update.timer)"
     fi
     echo
