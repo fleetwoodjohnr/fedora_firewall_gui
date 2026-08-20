@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically check for Firewall app updates
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+Unit=firewall-gui-update.service
+
+[Install]
+WantedBy=timers.target

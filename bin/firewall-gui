@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+_INSTALL_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "firewall-gui")
+if os.path.isdir(_INSTALL_DIR) and _INSTALL_DIR not in sys.path:
+    sys.path.insert(0, _INSTALL_DIR)
+else:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from firewall_gui.main import main
+
+if __name__ == "__main__":
+    sys.exit(main())

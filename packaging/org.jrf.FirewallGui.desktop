@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Firewall
+Comment=View and edit firewalld zones, services, and per-network profiles
+Exec=firewall-gui
+Icon=org.jrf.FirewallGui
+Terminal=false
+Categories=System;Security;Network;
+Keywords=firewall;firewalld;security;network;
+StartupNotify=true

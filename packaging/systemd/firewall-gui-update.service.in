@@ -1,0 +1,9 @@
+[Unit]
+Description=Check for and apply Firewall app updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@SRC_DIR@
+ExecStart=@SRC_DIR@/packaging/scripts/update.sh
