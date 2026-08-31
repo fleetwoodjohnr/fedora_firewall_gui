@@ -14,6 +14,11 @@ IFACE_ZONE = "org.fedoraproject.FirewallD1.zone"
 IFACE_CONFIG = "org.fedoraproject.FirewallD1.config"
 IFACE_CONFIG_ZONE = "org.fedoraproject.FirewallD1.config.zone"
 
+# One config.zone proxy is created per zone, so the saved GetAll adds up.
+CONFIG_PROXY_FLAGS = (
+    Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES | Gio.DBusProxyFlags.DO_NOT_CONNECT_SIGNALS
+)
+
 # getZoneSettings2 returns a sparse a{sv} dict: keys holding an empty/default
 # value are simply omitted rather than present with a zero value, so callers
 # must merge onto these defaults rather than indexing the raw result.
@@ -110,8 +115,11 @@ class FirewalldClient(GObject.Object):
             Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None,
             BUS_NAME, MAIN_PATH, IFACE_ZONE, None, on_zone, None,
         )
+        # Config proxies are method-call channels only -- no g-signal handler
+        # is ever attached and no cached property is ever read -- so skip the
+        # GetAll and the match rules.
         Gio.DBusProxy.new_for_bus(
-            Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None,
+            Gio.BusType.SYSTEM, CONFIG_PROXY_FLAGS, None,
             BUS_NAME, CONFIG_PATH, IFACE_CONFIG, None, on_config, None,
         )
 
@@ -190,7 +198,7 @@ class FirewalldClient(GObject.Object):
                 callback(proxy, None)
 
             Gio.DBusProxy.new_for_bus(
-                Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None,
+                Gio.BusType.SYSTEM, CONFIG_PROXY_FLAGS, None,
                 BUS_NAME, path, IFACE_CONFIG_ZONE, None, on_proxy, None,
             )
 

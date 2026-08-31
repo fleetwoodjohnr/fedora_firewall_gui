@@ -7,6 +7,7 @@ from gi.repository import Adw, Gtk
 from .backend.firewalld import FirewalldClient
 from .backend.hardening import HardeningClient
 from .backend.networkmanager import NetworkManagerClient
+from .backend.systemd import SystemdClient
 from .pages.dashboard import DashboardPage
 from .pages.hardening import HardeningPage
 from .pages.network_profiles import NetworkProfilesPage
@@ -23,6 +24,7 @@ class FirewallGuiWindow(Adw.ApplicationWindow):
         self.firewalld = FirewalldClient()
         self.netmgr = NetworkManagerClient()
         self.hardening = HardeningClient()
+        self.systemd = SystemdClient()
         self.settings = AppSettings()
 
         self.toast_overlay = Adw.ToastOverlay()
@@ -86,7 +88,9 @@ class FirewallGuiWindow(Adw.ApplicationWindow):
         dashboard = DashboardPage(self, self.firewalld, self.netmgr, self.settings)
         zone_editor = ZoneEditorPage(self, self.firewalld, self.settings)
         network_profiles = NetworkProfilesPage(self, self.firewalld, self.netmgr, self.settings)
-        hardening = HardeningPage(self, self.firewalld, self.netmgr, self.settings, self.hardening)
+        hardening = HardeningPage(
+            self, self.firewalld, self.netmgr, self.settings, self.hardening, self.systemd
+        )
 
         view_stack.add_titled_with_icon(dashboard, "dashboard", "Dashboard", "security-high-symbolic")
         view_stack.add_titled_with_icon(zone_editor, "zone-editor", "Zone Editor", "preferences-system-symbolic")

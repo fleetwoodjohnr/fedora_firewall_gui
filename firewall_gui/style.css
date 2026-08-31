@@ -1,0 +1,60 @@
+/* firewall-gui stylesheet.
+ *
+ * Colours are libadwaita's semantic names (@success_bg_color and friends)
+ * rather than literal hex, so light and dark themes and the user's accent
+ * choice are all handled by the platform instead of by a second palette here.
+ *
+ * Colour is never the only signal on any control below: a switch still shows
+ * its position and a level bar still shows its label, so this reads correctly
+ * for colourblind users too.
+ */
+
+/* --- Switches: green for on, red for off, everywhere in the app ----------
+ *
+ * Reaches both a bare Gtk.Switch and the one Adw.SwitchRow builds internally
+ * (row > box.header > box.suffixes > switch).
+ */
+switch {
+  background-color: @error_bg_color;
+  border-color: shade(@error_bg_color, 0.8);
+}
+
+switch:checked {
+  background-color: @success_bg_color;
+  border-color: shade(@success_bg_color, 0.8);
+}
+
+/* A switch that can't be operated shouldn't shout. Mid-apply and
+ * helper-unavailable states both land here. */
+switch:disabled {
+  background-color: alpha(@error_bg_color, 0.4);
+  border-color: alpha(@error_bg_color, 0.3);
+}
+
+switch:checked:disabled {
+  background-color: alpha(@success_bg_color, 0.4);
+  border-color: alpha(@success_bg_color, 0.3);
+}
+
+/* --- Hardening level bars: graded red -> amber -> green -------------------
+ *
+ * The class lives on the toggle-group and names the selected level. Adw
+ * interleaves <separator> nodes between the <toggle> children, so :nth-child()
+ * would count the separators as well -- driving the colour from a class on the
+ * parent avoids that entirely.
+ */
+toggle-group.level-off > toggle:checked {
+  background-color: @error_bg_color;
+  color: @error_fg_color;
+}
+
+toggle-group.level-basic > toggle:checked {
+  background-color: @warning_bg_color;
+  color: @warning_fg_color;
+}
+
+toggle-group.level-balanced > toggle:checked,
+toggle-group.level-strict > toggle:checked {
+  background-color: @success_bg_color;
+  color: @success_fg_color;
+}

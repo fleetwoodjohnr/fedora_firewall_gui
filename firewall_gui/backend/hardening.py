@@ -6,7 +6,7 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib
 
-from .errors import HelperNotInstalled, HelperVersionMismatch, translate_helper_error
+from .errors import HelperError, HelperNotInstalled, HelperVersionMismatch, translate_helper_error
 
 HELPER_PATH = "/usr/libexec/firewall-gui-helper"
 
@@ -15,6 +15,12 @@ HELPER_PATH = "/usr/libexec/firewall-gui-helper"
 # and can only be replaced with sudo, so the two will drift apart eventually.
 # Detecting that is much better than misreading a status payload.
 PROTOCOL_VERSION = 1
+
+# A PolicyKit prompt sits inside a privileged run, so this has to allow for a
+# person finding their password. It exists only so that a prompt that never
+# resolves can't leave the control greyed out forever -- previously there was
+# no timeout at all and no path back to a usable UI.
+CALL_TIMEOUT_SECONDS = 180
 
 
 class HardeningClient:
@@ -68,18 +74,50 @@ class HardeningClient:
             callback(None, translate_helper_error(-1, str(e)))
             return
 
+        # Guard against a call that never comes back. `finished` makes the two
+        # paths mutually exclusive, so a late timeout can't fire after success
+        # and a completion can't run after we've already reported a timeout.
+        state = {"finished": False, "timeout_id": None}
+
+        def finish(stdout, error):
+            if state["finished"]:
+                return
+            state["finished"] = True
+            if state["timeout_id"] is not None:
+                GLib.source_remove(state["timeout_id"])
+                state["timeout_id"] = None
+            callback(stdout, error)
+
+        def on_timeout():
+            state["timeout_id"] = None
+            proc.force_exit()
+            finish(None, HelperError(
+                f"the helper didn't respond within {CALL_TIMEOUT_SECONDS} seconds and was stopped. "
+                "If an authentication prompt appeared, it may have been dismissed or missed."
+            ))
+            return GLib.SOURCE_REMOVE
+
         def on_done(source, result, _data=None):
+            # After a timeout we've already reported and force-killed the child;
+            # returning early keeps us from asking a signal-killed process for an
+            # exit status, which GLib rightly complains about.
+            if state["finished"]:
+                return
             try:
                 _ok, stdout, stderr = proc.communicate_utf8_finish(result)
             except GLib.Error as e:
-                callback(None, translate_helper_error(-1, str(e)))
+                finish(None, translate_helper_error(-1, str(e)))
+                return
+            if not proc.get_if_exited():
+                finish(None, HelperError("the helper was terminated before it could finish"))
                 return
             status = proc.get_exit_status()
             if status != 0:
-                callback(None, translate_helper_error(status, stderr))
+                finish(None, translate_helper_error(status, stderr))
                 return
-            callback(stdout, None)
+            finish(stdout, None)
 
+        state["timeout_id"] = GLib.timeout_add_seconds(CALL_TIMEOUT_SECONDS, on_timeout)
         proc.communicate_utf8_async(None, None, on_done, None)
 
     def _run_json(self, args, privileged, callback):

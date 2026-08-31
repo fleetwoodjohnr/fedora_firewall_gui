@@ -1,3 +1,5 @@
+import os
+
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -17,8 +19,10 @@ from ..data.encryption_levels import (
     REBOOT_NOTE,
     get_encryption_level,
 )
-from ..widgets.confirm import escape_markup, show_error_toast, show_toast
+from ..widgets.debounce import Debouncer
+from ..widgets.confirm import confirm, escape_markup, show_error_toast, show_toast
 from ..widgets.level_selector import LevelSelector
+from ..widgets.state_switch import StateBackedSwitch
 
 # How each DNS level wants NetworkManager's per-connection dns-over-tls set on a
 # connection with a pinned resolver. "" means "leave it at the default", which
@@ -59,34 +63,38 @@ class HardeningPage(Adw.PreferencesPage):
         limits itself to the half that doesn't need it.
     """
 
-    def __init__(self, window, firewalld, netmgr, settings, hardening):
+    def __init__(self, window, firewalld, netmgr, settings, hardening, systemd):
         super().__init__(title="Hardening", icon_name="channel-secure-symbolic")
         self._window = window
         self._fw = firewalld
         self._nm = netmgr
         self._settings = settings
         self._hardening = hardening
+        self._systemd = systemd
 
         self._status = None
         self._default_zone = None
         self._zone_services = set()
         self._connection_rows = {}
         self._provider_syncing = False
-        self._connection_syncing = False
+        self._sshd_state = None
 
         self._build_helper_group()
         self._build_dns_group()
+        self._build_resolver_group()
         self._build_encryption_group()
 
         # Someone can close the same services by hand in the Zone Editor, so the
         # encryption level's firewall half has to re-read rather than assume.
+        self._refresh_zone_services_debounced = Debouncer(self._refresh_zone_services)
         for signal in ("zone-updated", "service-added", "service-removed"):
-            self._fw.connect(signal, lambda *_a: self._refresh_zone_services())
+            self._fw.connect(signal, self._refresh_zone_services_debounced)
 
     def refresh(self):
         self._refresh_status()
         self._refresh_zone_services()
         self._refresh_connections()
+        self._refresh_sshd()
 
     # -- Helper availability -------------------------------------------------------
 
@@ -142,24 +150,28 @@ class HardeningPage(Adw.PreferencesPage):
         )
         group.add(_card(self._dns_selector))
 
-        self._provider_expander = Adw.ExpanderRow(
-            title="Choose who answers your lookups",
-            subtitle="Optional. Independent of the level above — that setting protects your lookups, "
-            "this one decides which company sees them.",
+    def _build_resolver_group(self):
+        # Its own visible group rather than tucked inside an expander: which
+        # company answers your lookups is a decision in its own right, not a
+        # detail of the level above, and it can't be made without reading what
+        # each provider actually does.
+        self._resolver_group = Adw.PreferencesGroup(
+            title="DNS Resolver",
+            description="Independent of the level above. That setting protects your lookups in transit; "
+            "this one decides which company gets to see them in the first place.",
         )
-        self._provider_expander.set_subtitle_lines(0)
-        group.add(self._provider_expander)
+        self.add(self._resolver_group)
 
         self._provider_combo = Adw.ComboRow(
-            title="Resolver",
+            title="Answer my lookups with",
             model=Gtk.StringList.new([p.label for p in DNS_PROVIDERS]),
         )
         self._provider_combo.connect("notify::selected", self._on_provider_selected)
-        self._provider_expander.add_row(self._provider_combo)
+        self._resolver_group.add(self._provider_combo)
 
         self._provider_detail = Adw.ActionRow()
         self._provider_detail.set_subtitle_lines(0)
-        self._provider_expander.add_row(self._provider_detail)
+        self._resolver_group.add(self._provider_detail)
 
         self._connections_header = Adw.ActionRow(
             title="Apply to these saved networks",
@@ -167,7 +179,7 @@ class HardeningPage(Adw.PreferencesPage):
             "unless you specifically want its lookups leaving the tunnel.",
         )
         self._connections_header.set_subtitle_lines(0)
-        self._provider_expander.add_row(self._connections_header)
+        self._resolver_group.add(self._connections_header)
 
         self._sync_provider_combo()
 
@@ -184,17 +196,47 @@ class HardeningPage(Adw.PreferencesPage):
         self._provider_detail.set_subtitle(escape_markup(provider.detail))
         pinnable = provider.id != "automatic"
         self._connections_header.set_sensitive(pinnable)
-        if not pinnable:
+        for entry in self._connection_rows.values():
+            entry["row"].set_sensitive(pinnable)
+        self._update_pin_summary()
+
+    def _update_pin_summary(self):
+        """Say whether the chosen resolver is actually in use.
+
+        Picking a provider on its own changes nothing -- it has to be switched
+        on per connection. Without this the page would let someone select Quad9,
+        see it sitting there in the dropdown, and reasonably believe their
+        lookups had moved when they hadn't. Saying "selected but not in use" out
+        loud is the same rule the rest of this page follows: report what the
+        system is doing, not what was asked for.
+        """
+        provider = get_dns_provider(self._settings.dns_provider)
+        if provider.id == "automatic":
+            self._connections_header.remove_css_class("warning")
             self._connections_header.set_subtitle(
                 "Nothing to apply — “Automatic” leaves each network's own resolver in place."
             )
-        else:
+            return
+
+        short = provider.label.split(" — ")[0]
+        pinned = [
+            entry["conn"]["name"]
+            for uuid, entry in self._connection_rows.items()
+            if uuid in set(self._settings.get_pinned_uuids())
+        ]
+        if pinned:
+            self._connections_header.remove_css_class("warning")
             self._connections_header.set_subtitle(
-                "Pick the networks that should use the resolver above. Leave a VPN switched off "
-                "unless you specifically want its lookups leaving the tunnel."
+                f"{short} is in use on: {', '.join(sorted(pinned))}. Every other network keeps its own "
+                "resolver."
             )
-        for entry in self._connection_rows.values():
-            entry["row"].set_sensitive(pinnable)
+        else:
+            self._connections_header.add_css_class("warning")
+            self._connections_header.set_subtitle(
+                f"{short} is selected but not in use anywhere yet — switch on the networks below that "
+                "should use it. Until you do, your lookups still go to whichever resolver each network "
+                "or VPN hands you."
+            )
 
     def _on_provider_selected(self, combo, _pspec):
         if self._provider_syncing:
@@ -213,7 +255,7 @@ class HardeningPage(Adw.PreferencesPage):
     def _refresh_connections(self):
         def on_connections(connections, error):
             for entry in self._connection_rows.values():
-                self._provider_expander.remove(entry["row"])
+                self._resolver_group.remove(entry["row"])
             self._connection_rows.clear()
             if error is not None:
                 show_error_toast(self._window.toast_overlay, error, "Couldn't list saved networks")
@@ -225,6 +267,7 @@ class HardeningPage(Adw.PreferencesPage):
                 if conn["type"] == "loopback":
                     continue
                 self._add_connection_row(conn, conn["uuid"] in pinned, provider)
+            self._update_pin_summary()
 
         self._nm.list_connections(on_connections)
 
@@ -237,39 +280,36 @@ class HardeningPage(Adw.PreferencesPage):
         row = Adw.SwitchRow(title=escape_markup(conn["name"]), subtitle=subtitle)
         row.set_subtitle_lines(0)
         row.set_sensitive(provider.id != "automatic")
-        self._connection_syncing = True
-        row.set_active(pinned)
-        self._connection_syncing = False
-        row.connect("notify::active", self._on_connection_toggled, conn["uuid"])
-        self._provider_expander.add_row(row)
-        self._connection_rows[conn["uuid"]] = {"row": row, "conn": conn}
+        uuid = conn["uuid"]
+        switch = StateBackedSwitch(
+            row, lambda wanted, done, u=uuid: self._request_pin(u, wanted, done)
+        )
+        switch.set_applied(pinned)
+        self._resolver_group.add(row)
+        self._connection_rows[uuid] = {"row": row, "conn": conn, "switch": switch}
 
-    def _on_connection_toggled(self, row, _pspec, uuid):
-        if self._connection_syncing:
+    def _request_pin(self, uuid, wanted, done):
+        """Called by StateBackedSwitch only for a real user request."""
+        entry = self._connection_rows.get(uuid)
+        if entry is None:
             return
+        row = entry["row"]
         provider = get_dns_provider(self._settings.dns_provider)
-        wanted = row.get_active()
-
-        # Same non-optimistic rule as everywhere else: put it back, then let the
-        # result move it.
-        self._connection_syncing = True
-        row.set_active(not wanted)
-        self._connection_syncing = False
         row.set_sensitive(False)
 
-        def done(ok, error):
+        def finished(ok, error):
             row.set_sensitive(provider.id != "automatic")
             if not ok:
                 show_error_toast(self._window.toast_overlay, error, "Couldn't change this network's DNS")
+                done(False)
                 return
-            self._connection_syncing = True
-            row.set_active(wanted)
-            self._connection_syncing = False
             pinned = set(self._settings.get_pinned_uuids())
             pinned.add(uuid) if wanted else pinned.discard(uuid)
             self._settings.set_pinned_uuids(pinned)
+            done(True)
+            self._update_pin_summary()
 
-        self._pin_one(uuid, provider, unpin=not wanted, callback=done)
+        self._pin_one(uuid, provider, unpin=not wanted, callback=finished)
 
     def _pin_one(self, uuid, provider, unpin, callback):
         if unpin:
@@ -347,7 +387,15 @@ class HardeningPage(Adw.PreferencesPage):
         self._crypto_row.set_subtitle_lines(0)
         group.add(self._crypto_row)
 
-        self._ssh_row = Adw.ActionRow(title="SSH server", subtitle="Checking…")
+        self._sshd_row = Adw.SwitchRow(
+            title="Allow remote login to this laptop over SSH",
+            subtitle="Checking…",
+        )
+        self._sshd_row.set_subtitle_lines(0)
+        self._sshd_switch = StateBackedSwitch(self._sshd_row, self._request_sshd)
+        group.add(self._sshd_row)
+
+        self._ssh_row = Adw.ActionRow(title="SSH hardening", subtitle="Checking…")
         self._ssh_row.set_subtitle_lines(0)
         group.add(self._ssh_row)
 
@@ -375,6 +423,7 @@ class HardeningPage(Adw.PreferencesPage):
                     return
                 self._zone_services = set(zone_settings.get("services", []))
                 self._update_services_row()
+                self._update_sshd_row()
 
             self._fw.get_zone_settings(zone, on_settings)
 
@@ -447,6 +496,136 @@ class HardeningPage(Adw.PreferencesPage):
             self._fw.remove_service(zone, service, on_step)
         for service in to_restore:
             self._fw.add_service(zone, service, on_step)
+
+    # -- SSH server on/off ------------------------------------------------------------
+    #
+    # Separate from the encryption levels on purpose. The levels harden a server
+    # you intend to run; this switches off one you don't. On a laptop that has
+    # never accepted an SSH login, turning the server off is worth more than any
+    # amount of hardening applied to it -- there is nothing left to attack.
+
+    SSHD_UNIT = "sshd.service"
+    SSHD_ALSO = ("sshd.socket",)
+
+    @staticmethod
+    def _user_has_ssh_key():
+        path = os.path.expanduser("~/.ssh/authorized_keys")
+        try:
+            return os.path.getsize(path) > 0
+        except OSError:
+            return False
+
+    def _refresh_sshd(self):
+        def on_connected(error):
+            if error is not None:
+                self._sshd_row.set_sensitive(False)
+                self._sshd_row.set_subtitle(f"Couldn't reach systemd to check: {error}")
+                return
+
+            def on_state(state, state_error):
+                if state_error is not None or state is None:
+                    self._sshd_row.set_sensitive(False)
+                    self._sshd_row.set_subtitle(f"Couldn't read the SSH server's state: {state_error}")
+                    return
+                self._sshd_state = state
+                self._sshd_switch.set_applied(state["enabled"] or state["active"])
+                self._update_sshd_row()
+
+            self._systemd.get_service_state(self.SSHD_UNIT, on_state)
+
+        self._systemd.ensure_connected(on_connected)
+
+    def _update_sshd_row(self):
+        state = self._sshd_state
+        if state is None:
+            return
+        if not state["exists"]:
+            self._sshd_row.set_sensitive(False)
+            self._sshd_row.set_subtitle(
+                "OpenSSH server isn't installed, so nothing is listening for remote logins."
+            )
+            return
+
+        self._sshd_row.set_sensitive(True)
+        if not (state["enabled"] or state["active"]):
+            self._sshd_row.set_subtitle(
+                "Off. Nothing can log in to this laptop over SSH. Connecting out to other machines "
+                "with ssh, scp or git is unaffected — that's a separate program."
+            )
+            self._sshd_row.remove_css_class("warning")
+            return
+
+        # Reachability is the part people get wrong, so spell it out rather than
+        # leaving them to cross-reference the Zone Editor.
+        reachable = "ssh" in self._zone_services
+        where = (
+            f"reachable from the network — your default zone “{self._default_zone}” allows it"
+            if reachable
+            else f"but your firewall's default zone “{self._default_zone}” is blocking incoming "
+                 "connections, so it isn't reachable from the network right now"
+        )
+        running = "Running" if state["active"] else "Enabled at boot but not running"
+        password_note = (
+            " No SSH key is installed for you, so logins would use a password."
+            if not self._user_has_ssh_key()
+            else ""
+        )
+        self._sshd_row.set_subtitle(f"{running}, {where}.{password_note}")
+        if reachable and not self._user_has_ssh_key():
+            self._sshd_row.add_css_class("warning")
+        else:
+            self._sshd_row.remove_css_class("warning")
+
+    def _request_sshd(self, wanted, done):
+        """Called by StateBackedSwitch only for a real user request."""
+        row = self._sshd_row
+
+        def apply():
+            row.set_sensitive(False)
+
+            def finished(ok, error):
+                row.set_sensitive(True)
+                if ok:
+                    show_toast(
+                        self._window.toast_overlay,
+                        "SSH server turned on." if wanted else "SSH server turned off.",
+                    )
+                else:
+                    show_error_toast(self._window.toast_overlay, error, "Couldn't change the SSH server")
+                done(ok)
+                self._refresh_sshd()
+
+            self._systemd.set_service_enabled(
+                self.SSHD_UNIT, wanted, also_disable=() if wanted else self.SSHD_ALSO, callback=finished
+            )
+
+        if wanted:
+            body = (
+                "This starts the OpenSSH server and sets it to start at every boot, so other machines "
+                "can log in to this laptop.\n\n"
+                "Your firewall still decides who can actually reach it — add the “ssh” service to a zone "
+                "in the Zone Editor if you want it reachable from the network."
+            )
+            if not self._user_has_ssh_key():
+                body += (
+                    "\n\nWorth knowing: you have no SSH key installed, so logins would fall back to your "
+                    "account password. Add a key first (ssh-copy-id from the machine you'll connect from) "
+                    "and the encryption levels above can then switch password logins off entirely."
+                )
+            confirm(self._window, "Turn on the SSH server?", body, "Turn It On", apply, destructive=True)
+        else:
+            confirm(
+                self._window,
+                "Turn off the SSH server?",
+                "This stops the OpenSSH server and prevents it starting at boot, so nothing will be able "
+                "to log in to this laptop over SSH.\n\n"
+                "It does not affect connecting out — ssh, scp, sftp and git carry on working normally, "
+                "because those are the client, a separate program. Nothing is uninstalled, and you can "
+                "switch it back on here whenever you want.",
+                "Turn It Off",
+                apply,
+                destructive=False,
+            )
 
     # -- Status ---------------------------------------------------------------------------
 

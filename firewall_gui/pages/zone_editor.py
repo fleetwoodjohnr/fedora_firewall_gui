@@ -6,6 +6,7 @@ from gi.repository import Adw, Gtk
 
 from ..data.services_catalog import COMMON_SERVICES, get_service_info
 from ..data.zones_catalog import filter_zones, get_zone_info, summarize_zone_settings
+from ..widgets.debounce import Debouncer
 from ..widgets.confirm import confirm, show_error_toast
 from ..widgets.service_row import ServiceRow
 
@@ -34,11 +35,13 @@ class ZoneEditorPage(Adw.PreferencesPage):
         self._build_services_group()
         self._build_custom_ports_group()
 
-        self._fw.connect("zone-updated", self._on_backend_signal)
-        self._fw.connect("service-added", self._on_backend_signal)
-        self._fw.connect("service-removed", self._on_backend_signal)
-        self._fw.connect("port-added", self._on_backend_signal)
-        self._fw.connect("port-removed", self._on_backend_signal)
+        # Debounced: _on_backend_signal rebuilds a row for every service
+        # firewalld knows about (265 here, ~0.29s), and a single hardening
+        # change emits several signals in a burst. Undebounced, those rebuilds
+        # run back to back and lock up the UI.
+        self._on_backend_signal_debounced = Debouncer(self._on_backend_signal)
+        for _signal in ("zone-updated", "service-added", "service-removed", "port-added", "port-removed"):
+            self._fw.connect(_signal, self._on_backend_signal_debounced)
         self._settings.connect("notify::show-all-zones", self._on_show_all_zones_changed)
 
         self._fw.list_all_services(self._on_all_services_loaded)

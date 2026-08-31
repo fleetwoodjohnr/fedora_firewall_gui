@@ -37,6 +37,7 @@ class LevelSelector(Gtk.Box):
         self._active_index = 0
         self._syncing = False
         self._buttons = []
+        self._styled = None
 
         self._build_control()
 
@@ -45,6 +46,7 @@ class LevelSelector(Gtk.Box):
         self.append(self._description)
 
         self._show_description(0)
+        self._sync_level_class()
 
     # -- control construction ---------------------------------------------------
 
@@ -55,6 +57,7 @@ class LevelSelector(Gtk.Box):
                 self._group.add(Adw.Toggle(label=level.label))
             self._group.set_active(0)
             self._group.connect("notify::active", self._on_toggle_group_changed)
+            self._styled = self._group
             self.append(self._group)
             return
 
@@ -73,6 +76,7 @@ class LevelSelector(Gtk.Box):
             self._buttons.append(button)
             box.append(button)
         self._fallback_box = box
+        self._styled = box
         self.append(box)
 
     def _get_index(self):
@@ -106,6 +110,12 @@ class LevelSelector(Gtk.Box):
         self._requested(index)
 
     def _requested(self, index):
+        # Adw.ToggleGroup.get_active() returns ADW_TOGGLE_GROUP_NO_ACTIVE
+        # (0xFFFFFFFF) when nothing is selected, which would index out of range.
+        # PyGObject swallows the resulting exception into a printed traceback and
+        # the click silently does nothing, so check rather than let it happen.
+        if index < 0 or index >= len(self._levels):
+            return
         if index == self._active_index:
             return
         level = self._levels[index]
@@ -125,6 +135,7 @@ class LevelSelector(Gtk.Box):
                     self._active_index = index
                     self._set_index(index)
                     self._show_description(index)
+                    self._sync_level_class()
                 else:
                     self._show_description(self._active_index)
 
@@ -149,6 +160,20 @@ class LevelSelector(Gtk.Box):
         else:
             self._fallback_box.set_sensitive(sensitive)
 
+    def _sync_level_class(self):
+        """Put a single level-<id> class on the control so style.css can colour
+        the selected notch red -> amber -> green.
+
+        Driven by _active_index, not by whatever the user is previewing: the
+        colour is a readout of the applied state, and it would be misleading for
+        it to go green before the change had actually landed.
+        """
+        if self._styled is None:
+            return
+        for level in self._levels:
+            self._styled.remove_css_class(f"level-{level.id}")
+        self._styled.add_css_class(f"level-{self._levels[self._active_index].id}")
+
     def _show_description(self, index):
         level = self._levels[index]
         current = " (current)" if index == self._active_index else ""
@@ -168,10 +193,12 @@ class LevelSelector(Gtk.Box):
                 self._active_index = index
                 self._set_index(index)
                 self._show_description(index)
+                self._sync_level_class()
                 return
         self._active_index = 0
         self._set_index(0)
         self._show_description(0)
+        self._sync_level_class()
 
     def get_active_level(self):
         return self._levels[self._active_index]

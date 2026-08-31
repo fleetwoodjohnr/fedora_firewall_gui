@@ -6,6 +6,8 @@ from gi.repository import Adw, Gtk, GLib
 
 from ..data.hardening_rules import get_applicable_rules
 from ..data.zones_catalog import filter_zones, get_zone_info
+from ..widgets.debounce import Debouncer
+from ..widgets.state_switch import StateBackedSwitch
 from ..widgets.confirm import confirm, escape_markup, show_error_toast, show_toast
 
 
@@ -20,18 +22,16 @@ class DashboardPage(Adw.PreferencesPage):
         self._rows_by_iface = {}
         self._hardening_zone = None
         self._hardening_rules = []
-        self._panic_syncing = False
+        self._nm_poll_in_flight = False
 
         self._build_active_connections_group()
         self._build_panic_group()
         self._build_hardening_group()
 
         self._fw.connect("interface-zone-changed", self._on_interface_zone_changed)
-        self._fw.connect("zone-updated", lambda *_a: self._refresh_hardening())
-        self._fw.connect("service-added", lambda *_a: self._refresh_hardening())
-        self._fw.connect("service-removed", lambda *_a: self._refresh_hardening())
-        self._fw.connect("port-added", lambda *_a: self._refresh_hardening())
-        self._fw.connect("port-removed", lambda *_a: self._refresh_hardening())
+        self._refresh_hardening_debounced = Debouncer(self._refresh_hardening)
+        for _signal in ("zone-updated", "service-added", "service-removed", "port-added", "port-removed"):
+            self._fw.connect(_signal, self._refresh_hardening_debounced)
         self._fw.connect("panic-mode-changed", self._on_panic_mode_changed)
         self._settings.connect("notify::show-all-zones", self._on_show_all_zones_changed)
 
@@ -43,7 +43,11 @@ class DashboardPage(Adw.PreferencesPage):
         self._fw.query_panic_mode(self._on_initial_panic_state)
 
     def _poll_nm(self):
-        self._refresh_active_connections()
+        # Skip this tick if the previous nmcli is still running. Without the
+        # guard a slow nmcli (which a VPN can easily cause) means overlapping
+        # spawns pile up every five seconds for as long as the app is open.
+        if not self._nm_poll_in_flight:
+            self._refresh_active_connections()
         return True
 
     # -- Active Connection ---------------------------------------------------
@@ -56,7 +60,10 @@ class DashboardPage(Adw.PreferencesPage):
         self.add(self._active_group)
 
     def _refresh_active_connections(self):
+        self._nm_poll_in_flight = True
+
         def on_connections(connections, error):
+            self._nm_poll_in_flight = False
             if error is not None:
                 show_error_toast(self._window.toast_overlay, error, "Couldn't list network connections")
                 return
@@ -214,21 +221,24 @@ class DashboardPage(Adw.PreferencesPage):
             "everything right now. This app keeps working the whole time so you can switch it back off.",
         )
         self._panic_row.add_css_class("error")
-        self._panic_row.connect("notify::active", self._on_panic_switch_notify)
+        self._panic_switch = StateBackedSwitch(self._panic_row, self._request_panic)
         group.add(self._panic_row)
 
-    def _on_panic_switch_notify(self, row, _pspec):
-        if self._panic_syncing:
-            return
-        requested = row.get_active()
-        self._panic_syncing = True
-        row.set_active(not requested)
-        self._panic_syncing = False
+    def _request_panic(self, requested, done):
+        """Called by StateBackedSwitch only for a real user request.
+
+        Previously this reverted the row under a boolean guard, which could
+        re-enter itself and ping-pong between the two confirmation dialogs.
+        """
+        def do_apply():
+            def on_result(ok, error):
+                if not ok and error is not None:
+                    show_error_toast(self._window.toast_overlay, error, "Couldn't change panic mode")
+                done(ok)
+
+            self._fw.set_panic_mode(requested, on_result)
 
         if requested:
-            def do_enable():
-                self._fw.set_panic_mode(True, self._on_panic_result)
-
             confirm(
                 self._window,
                 "Enable Panic Mode?",
@@ -237,27 +247,23 @@ class DashboardPage(Adw.PreferencesPage):
                 "back off.\n\nThis app keeps working the whole time, because it talks to firewalld over the "
                 "local system bus, not the network — so you can always come back here and switch it off.",
                 "Enable Panic Mode",
-                do_enable,
+                do_apply,
                 destructive=True,
             )
         else:
-            self._fw.set_panic_mode(False, self._on_panic_result)
+            do_apply()
 
     def _on_panic_result(self, ok, error):
         if not ok and error is not None:
             show_error_toast(self._window.toast_overlay, error, "Couldn't change panic mode")
 
     def _on_panic_mode_changed(self, fw, enabled):
-        self._panic_syncing = True
-        self._panic_row.set_active(enabled)
-        self._panic_syncing = False
+        self._panic_switch.set_applied(enabled)
 
     def _on_initial_panic_state(self, enabled, error):
         if error is not None:
             return
-        self._panic_syncing = True
-        self._panic_row.set_active(bool(enabled))
-        self._panic_syncing = False
+        self._panic_switch.set_applied(bool(enabled))
 
     # -- Recommended Hardening ---------------------------------------------------
 

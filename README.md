@@ -123,4 +123,8 @@ want to keep); use `make purge` instead to also remove that.
   **Encryption Hardening** moves the system-wide crypto policy, SSH, and your
   plaintext service ports together, from tidying up obsolete protocols at Basic
   through to `FUTURE` at Strict. Password logins are only disabled when a usable
-  SSH key is already installed, so it can't lock you out.
+  SSH key is already installed, so it can't lock you out. Alongside it, a switch
+  turns the SSH server itself on and off (`systemctl enable --now` /
+  `disable --now`, authorized by systemd's own PolicyKit action, so it works
+  with or without the helper) — on a laptop that never accepts remote logins,
+  switching the server off beats any amount of hardening applied to it.

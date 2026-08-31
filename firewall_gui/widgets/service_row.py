@@ -26,6 +26,7 @@ class ServiceRow(Adw.ExpanderRow):
         self._on_result_error = on_result_error
         self._on_first_expand = on_first_expand
         self._expanded_once = False
+        self._syncing = False
 
         self.set_title(info.label)
         self.set_subtitle(info.summary)
@@ -60,8 +61,11 @@ class ServiceRow(Adw.ExpanderRow):
             self.connect("notify::expanded", self._on_expanded_notify)
 
     def set_enabled(self, enabled):
+        """Sync the row to backend state without triggering a write."""
+        self._syncing = True
         self._switch.set_state(enabled)
         self._switch.set_active(enabled)
+        self._syncing = False
 
     def set_detail_text(self, summary, recommendation_text):
         self.set_subtitle(summary)
@@ -79,16 +83,27 @@ class ServiceRow(Adw.ExpanderRow):
         return query in self._name.lower() or query in self.info.label.lower() or query in self.info.summary.lower()
 
     def _on_state_set(self, switch, requested_state):
+        # gtk_switch_set_active() re-emits ::state-set, so any code path that
+        # moves `active` has to be guarded. On a *failed* toggle `active` holds
+        # the user's request while `state` still holds the old value, so putting
+        # `active` back below genuinely changes it -- and without this guard that
+        # re-entered here and issued a second, opposite firewalld write the user
+        # never asked for (and a second PolicyKit prompt with it).
+        if self._syncing:
+            return True
+
         switch.set_sensitive(False)
 
         def on_result(ok, error, partial):
             switch.set_sensitive(True)
+            self._syncing = True
             if ok:
                 switch.set_state(requested_state)
                 switch.set_active(requested_state)
             else:
                 switch.set_state(switch.get_state())
                 switch.set_active(switch.get_state())
+            self._syncing = False
             if error is not None or partial:
                 self._on_result_error(self._name, requested_state, error, partial)
 
