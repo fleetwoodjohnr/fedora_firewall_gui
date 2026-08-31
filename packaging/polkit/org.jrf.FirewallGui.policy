@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<policyconfig>
+
+  <vendor>firewall-gui</vendor>
+  <vendor_url>https://github.com/fleetwoodjohnr/fedora_firewall_gui</vendor_url>
+  <icon_name>security-high</icon_name>
+
+  <!--
+    One action, covering every change the Hardening page can make to the system:
+    the systemd-resolved drop-in, the system-wide crypto policy, and the sshd
+    drop-in. Reading current state needs no action at all - the helper's
+    `status` verb runs unprivileged, so simply opening the page never prompts.
+
+    auth_admin_keep, not auth_admin: applying a hardening level makes several
+    changes in a row, and prompting separately for each would train people to
+    click through password dialogs without reading them.
+  -->
+  <action id="org.jrf.FirewallGui.apply-hardening">
+    <description>Change system hardening settings</description>
+    <message>Authentication is required to change this system's DNS, encryption, and SSH hardening settings.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/firewall-gui-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+</policyconfig>

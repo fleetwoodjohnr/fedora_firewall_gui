@@ -9,6 +9,8 @@ BIN_DIR="$HOME/.local/bin"
 APPS_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+HELPER_PATH="/usr/libexec/firewall-gui-helper"
+POLKIT_ACTION_PATH="/usr/share/polkit-1/actions/org.jrf.FirewallGui.policy"
 
 require_cmd() {
     command -v "$1" >/dev/null 2>&1
@@ -125,6 +127,72 @@ install_update_timer() {
     fi
 }
 
+# The Hardening page's DNS and encryption levels need to write to /etc, which
+# nothing else in this app does -- firewalld and NetworkManager authorize their
+# own changes through PolicyKit and need no privileges from us.
+#
+# So this is the one part of the install that asks for root, and it stays
+# optional: decline it and the app still runs, with the Hardening page saying
+# what's missing and how to get it. The helper is installed root-owned into
+# /usr/libexec rather than left in ~/.local on purpose -- pkexec runs it as
+# root, and root must never execute a file that a compromised user account
+# could rewrite first.
+install_privileged_helper() {
+    local src_dir="$1"
+
+    if [[ -n "${FIREWALL_GUI_NO_HELPER:-}" ]]; then
+        return
+    fi
+
+    if ! require_cmd pkexec; then
+        echo "warning: pkexec not found — skipping the system hardening helper" >&2
+        echo "  (install it with: sudo dnf install polkit)" >&2
+        return
+    fi
+
+    if ! require_cmd sudo; then
+        echo "warning: sudo not found — skipping the system hardening helper" >&2
+        return
+    fi
+
+    # `curl | bash` leaves stdin pointing at the script, so there is nothing to
+    # read a y/n from. Skip rather than hang, and say how to opt in.
+    if [[ ! -t 0 && -z "${FIREWALL_GUI_HELPER:-}" ]]; then
+        echo "note: skipping the optional system hardening helper (not running interactively)" >&2
+        echo "  to install it, re-run from a checkout, or set FIREWALL_GUI_HELPER=1" >&2
+        return
+    fi
+
+    if [[ -z "${FIREWALL_GUI_HELPER:-}" ]]; then
+        echo
+        echo "The Hardening page can also manage your DNS privacy settings, the system-wide"
+        echo "crypto policy, and SSH hardening. Those need a small helper installed as root:"
+        echo "  $HELPER_PATH"
+        echo "  $POLKIT_ACTION_PATH"
+        echo "Everything else in the app works without it."
+        local reply=""
+        read -r -p "Install it now with sudo? [y/N] " reply
+        case "$reply" in
+            [Yy]*) ;;
+            *)
+                echo "Skipped. Re-run this installer later if you change your mind." >&2
+                return
+                ;;
+        esac
+    fi
+
+    if ! sudo install -D -o root -g root -m 0755 \
+            "$src_dir/packaging/helper/firewall-gui-helper" "$HELPER_PATH" \
+        || ! sudo install -D -o root -g root -m 0644 \
+            "$src_dir/packaging/polkit/org.jrf.FirewallGui.policy" "$POLKIT_ACTION_PATH"; then
+        echo "warning: couldn't install the system hardening helper — you can retry with:" >&2
+        echo "  sudo install -D -o root -g root -m 0755 \\" >&2
+        echo "    $src_dir/packaging/helper/firewall-gui-helper $HELPER_PATH" >&2
+        echo "  sudo install -D -o root -g root -m 0644 \\" >&2
+        echo "    $src_dir/packaging/polkit/org.jrf.FirewallGui.policy $POLKIT_ACTION_PATH" >&2
+    fi
+}
+
 print_summary() {
     local src_dir="$1"
     echo "Installed:"
@@ -133,6 +201,11 @@ print_summary() {
     echo "  Icon:          $ICON_DIR/org.jrf.FirewallGui.svg"
     echo "  App source:    $SHARE_DIR/firewall_gui"
     echo "  Checkout:      $src_dir"
+    if [[ -x "$HELPER_PATH" && -f "$POLKIT_ACTION_PATH" ]]; then
+        echo "  Hardening:     system helper installed ($HELPER_PATH)"
+    else
+        echo "  Hardening:     system helper not installed — DNS/encryption levels will be unavailable"
+    fi
     if require_cmd systemctl && systemctl --user is-enabled --quiet firewall-gui-update.timer 2>/dev/null; then
         echo "  Auto-update:   checks for updates every 30 minutes (systemctl --user status firewall-gui-update.timer)"
     fi
@@ -145,6 +218,7 @@ main() {
     local src_dir
     src_dir="$(resolve_src_dir)"
     install_app "$src_dir"
+    install_privileged_helper "$src_dir"
     if [[ -z "${FIREWALL_GUI_NO_TIMER:-}" ]]; then
         install_update_timer "$src_dir"
     fi

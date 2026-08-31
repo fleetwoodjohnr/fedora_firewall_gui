@@ -5,8 +5,10 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk
 
 from .backend.firewalld import FirewalldClient
+from .backend.hardening import HardeningClient
 from .backend.networkmanager import NetworkManagerClient
 from .pages.dashboard import DashboardPage
+from .pages.hardening import HardeningPage
 from .pages.network_profiles import NetworkProfilesPage
 from .pages.zone_editor import ZoneEditorPage
 from .settings import AppSettings
@@ -20,6 +22,7 @@ class FirewallGuiWindow(Adw.ApplicationWindow):
 
         self.firewalld = FirewalldClient()
         self.netmgr = NetworkManagerClient()
+        self.hardening = HardeningClient()
         self.settings = AppSettings()
 
         self.toast_overlay = Adw.ToastOverlay()
@@ -83,12 +86,14 @@ class FirewallGuiWindow(Adw.ApplicationWindow):
         dashboard = DashboardPage(self, self.firewalld, self.netmgr, self.settings)
         zone_editor = ZoneEditorPage(self, self.firewalld, self.settings)
         network_profiles = NetworkProfilesPage(self, self.firewalld, self.netmgr, self.settings)
+        hardening = HardeningPage(self, self.firewalld, self.netmgr, self.settings, self.hardening)
 
         view_stack.add_titled_with_icon(dashboard, "dashboard", "Dashboard", "security-high-symbolic")
         view_stack.add_titled_with_icon(zone_editor, "zone-editor", "Zone Editor", "preferences-system-symbolic")
         view_stack.add_titled_with_icon(
             network_profiles, "network-profiles", "Network Profiles", "network-wireless-symbolic"
         )
+        view_stack.add_titled_with_icon(hardening, "hardening", "Hardening", "channel-secure-symbolic")
 
         content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         content_box.append(view_stack)
@@ -96,6 +101,7 @@ class FirewallGuiWindow(Adw.ApplicationWindow):
         self._toolbar_view.set_content(content_box)
 
         dashboard.refresh()
+        hardening.refresh()
 
     def _show_connection_error(self, error):
         self._status_page.set_title("Couldn't connect to firewalld")

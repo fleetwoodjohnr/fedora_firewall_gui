@@ -139,6 +139,79 @@ class NetworkManagerClient:
 
         self._run(["connection", "modify", uuid, "connection.zone", zone], on_result)
 
+    # -- per-connection DNS ---------------------------------------------------
+    #
+    # Pinning a resolver has to happen per connection, not globally. A global
+    # `DNS=` in resolved.conf is only consulted when no link supplies its own,
+    # so with DHCP or a VPN up it is silently ignored -- the setting appears to
+    # apply and does nothing. NetworkManager writes these per-link into
+    # systemd-resolved, which is the only place they actually take effect.
+
+    def get_connection_dns(self, uuid, callback):
+        """callback(dns: dict | None, error)
+
+        Keys: ipv4, ipv6 (comma-joined server strings, "" when unpinned),
+        ignore_auto (bool), dns_over_tls (nmcli's int-as-string: -1 default,
+        0 no, 1 opportunistic, 2 yes).
+        """
+
+        def on_result(stdout, error):
+            if error:
+                callback(None, error)
+                return
+            values = {}
+            for line in (stdout or "").splitlines():
+                if not line:
+                    continue
+                fields = _split_terse_line(line)
+                if len(fields) < 2:
+                    continue
+                # Re-join the tail: nmcli escapes ':' inside values (IPv6
+                # addresses are full of them), but be defensive about one
+                # slipping through unescaped rather than truncating an address.
+                values[fields[0]] = ":".join(fields[1:])
+            callback(
+                {
+                    "ipv4": values.get("ipv4.dns", ""),
+                    "ipv6": values.get("ipv6.dns", ""),
+                    "ignore_auto": values.get("ipv4.ignore-auto-dns", "no") == "yes",
+                    "dns_over_tls": values.get("connection.dns-over-tls", "-1"),
+                },
+                None,
+            )
+
+        self._run(
+            ["-t", "-f", "ipv4.dns,ipv6.dns,ipv4.ignore-auto-dns,connection.dns-over-tls",
+             "connection", "show", uuid],
+            on_result,
+        )
+
+    def set_connection_dns(self, uuid, ipv4, ipv6, dns_over_tls, callback):
+        """Pin (or unpin) this connection's resolver. callback(ok: bool, error)
+
+        Pass "" for ipv4/ipv6 and "" for dns_over_tls to unpin: NetworkManager
+        treats an empty value as "back to the default", which restores the
+        network's own DNS rather than leaving an empty override behind.
+
+        `ignore-auto-dns` is the half people forget. Without it NetworkManager
+        appends your chosen servers to the ones DHCP handed out instead of
+        replacing them, and lookups quietly keep going to the network's resolver
+        whenever it answers first.
+        """
+        pinning = bool(ipv4 or ipv6)
+        ignore = "yes" if pinning else "no"
+
+        def on_result(stdout, error):
+            callback(error is None, error)
+
+        self._run(
+            ["connection", "modify", uuid,
+             "ipv4.dns", ipv4, "ipv4.ignore-auto-dns", ignore,
+             "ipv6.dns", ipv6, "ipv6.ignore-auto-dns", ignore,
+             "connection.dns-over-tls", dns_over_tls],
+            on_result,
+        )
+
     @staticmethod
     def is_vpn_like(conn_type):
         return conn_type in VPN_LIKE_TYPES

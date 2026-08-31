@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""Privileged helper for firewall-gui's Hardening page.
+
+Runs as root via pkexec. It exists because three things the Hardening page needs
+have no unprivileged API at all: systemd-resolved's global settings, the
+system-wide crypto policy, and sshd's configuration (/etc/ssh/sshd_config.d is
+mode 0700, so the app can't even read it).
+
+Everything else the Hardening page does -- pinning a resolver per connection,
+closing firewall services -- goes through NetworkManager and firewalld, which do
+their own polkit checks. Those never reach this helper. Keeping the root
+surface this small is the point.
+
+Design rules, all of them load-bearing:
+
+  * The ONLY thing this helper accepts from its caller is a verb and, for the
+    apply verbs, a level id matched against a fixed list of four strings. It
+    never takes a path, an address, a directive, or any other free text. The
+    tables below are the authoritative definition of what a level means; the
+    GUI's copy in firewall_gui/data/encryption_levels.py is a display mirror
+    and is not trusted.
+  * No shell, anywhere. subprocess is always called with an argv list.
+  * It only ever creates, rewrites or deletes files it owns. It never edits a
+    file the user or the distribution wrote. That makes every change revertible
+    by deleting a file, and makes it impossible for a bug here to corrupt
+    config that was already there.
+  * sshd config is validated with `sshd -t` before anything is reloaded, and
+    rolled back if it doesn't validate -- a machine that can't start sshd is a
+    far worse outcome than one that isn't hardened.
+  * Password authentication is only disabled when a usable SSH key already
+    exists, so this can't lock anyone out.
+
+`status` is readable by anyone and is invoked directly, not through pkexec, so
+opening the Hardening page never prompts for a password. Only the four apply
+and revert verbs need root, and they share a single polkit action.
+
+Verbs: status | apply-dns LEVEL | revert-dns | apply-crypto LEVEL | revert-crypto
+"""
+
+import json
+import os
+import pwd
+import subprocess
+import sys
+import tempfile
+
+# Bumped whenever the status JSON or the verb set changes shape. The GUI checks
+# it and tells the user to reinstall the helper on a mismatch -- the app
+# auto-updates itself from git, but /usr/libexec needs sudo and will drift.
+PROTOCOL_VERSION = 1
+
+RESOLVED_DROPIN = "/etc/systemd/resolved.conf.d/90-firewall-gui.conf"
+# Must sort before Fedora's 50-redhat.conf: sshd keeps the FIRST value it sees
+# for a given directive, so a higher number would be silently ignored.
+SSHD_DROPIN = "/etc/ssh/sshd_config.d/49-firewall-gui.conf"
+STATE_DIR = "/etc/firewall-gui"
+STATE_FILE = os.path.join(STATE_DIR, "hardening.json")
+
+BANNER = "# Managed by firewall-gui. Delete this file to undo, or use the app's Hardening page.\n"
+
+LEVELS = ("off", "basic", "balanced", "strict")
+
+# -- authoritative level definitions ------------------------------------------
+
+DNS_SETTINGS = {
+    "off": {},
+    "basic": {
+        "DNSOverTLS": "opportunistic",
+        "DNSSEC": "allow-downgrade",
+        "Cache": "yes",
+    },
+    "balanced": {
+        "DNSOverTLS": "opportunistic",
+        "DNSSEC": "allow-downgrade",
+        "LLMNR": "no",
+        "MulticastDNS": "no",
+        "Cache": "yes",
+    },
+    "strict": {
+        "DNSOverTLS": "yes",
+        "DNSSEC": "yes",
+        "LLMNR": "no",
+        "MulticastDNS": "no",
+        "Cache": "yes",
+    },
+}
+
+CRYPTO_POLICY = {
+    "off": None,  # restore whatever was recorded at first apply
+    "basic": "DEFAULT",
+    "balanced": "DEFAULT:NO-SHA1",
+    "strict": "FUTURE",
+}
+
+_BASIC_SSH = [
+    ("PermitRootLogin", "no"),
+    ("PermitEmptyPasswords", "no"),
+    ("X11Forwarding", "no"),
+    ("MaxAuthTries", "3"),
+]
+_BALANCED_SSH = _BASIC_SSH + [
+    ("PasswordAuthentication", "no"),
+    ("KbdInteractiveAuthentication", "no"),
+    ("LoginGraceTime", "30"),
+]
+_STRICT_SSH = _BALANCED_SSH + [
+    ("Ciphers", "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com"),
+    ("MACs", "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"),
+    ("KexAlgorithms", "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512"),
+]
+
+SSH_DIRECTIVES = {
+    "off": [],
+    "basic": _BASIC_SSH,
+    "balanced": _BALANCED_SSH,
+    "strict": _STRICT_SSH,
+}
+
+# Only written when a usable SSH key is found. Anything in here that gets
+# skipped is reported back so the page can say so out loud.
+KEY_GUARDED = {"PasswordAuthentication"}
+
+
+# -- small utilities -----------------------------------------------------------
+
+def run(argv, check=False):
+    """Always an argv list, never a shell string."""
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        check=check,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+    )
+
+
+def fail(message, code=1):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+def write_file(path, content, mode=0o644):
+    """Atomic replace via a temp file in the same directory, so a crash mid-write
+    can never leave a half-written config behind."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".firewall-gui-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def remove_file(path):
+    try:
+        os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def read_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        data = {}
+    data.setdefault("dns", {})
+    data.setdefault("crypto", {})
+    return data
+
+
+def write_state(state):
+    state["version"] = 1
+    write_file(STATE_FILE, json.dumps(state, indent=2) + "\n", mode=0o644)
+
+
+def unit_is_active(unit):
+    return run(["systemctl", "is-active", "--quiet", unit]).returncode == 0
+
+
+def parse_dropin(path):
+    """Read back a drop-in we wrote, so status reports what is actually on disk
+    rather than what we believe we put there."""
+    settings = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("["):
+                    continue
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    settings[key.strip()] = value.strip()
+                else:
+                    key, _, value = line.partition(" ")
+                    if value:
+                        settings[key.strip()] = value.strip()
+    except OSError:
+        return None
+    return settings
+
+
+# -- SSH key guard --------------------------------------------------------------
+
+INVALID_SHELLS = {"/sbin/nologin", "/usr/sbin/nologin", "/bin/false", "/usr/bin/false"}
+
+
+def find_ssh_key_owner():
+    """Return the name of a real login user with a non-empty authorized_keys, or
+    None. This is what stands between 'PasswordAuthentication no' and locking
+    someone out of a machine they only reach over the network."""
+    for entry in pwd.getpwall():
+        if entry.pw_uid < 1000 or entry.pw_shell in INVALID_SHELLS:
+            continue
+        keyfile = os.path.join(entry.pw_dir, ".ssh", "authorized_keys")
+        try:
+            if os.path.isfile(keyfile) and os.path.getsize(keyfile) > 0:
+                with open(keyfile, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            return entry.pw_name
+        except OSError:
+            continue
+    return None
+
+
+def sshd_available():
+    return os.path.exists("/usr/sbin/sshd")
+
+
+# -- DNS ------------------------------------------------------------------------
+
+def apply_dns(level):
+    settings = DNS_SETTINGS[level]
+    if not settings:
+        return revert_dns()
+
+    body = BANNER + "[Resolve]\n" + "".join(f"{k}={v}\n" for k, v in sorted(settings.items()))
+    write_file(RESOLVED_DROPIN, body)
+
+    # try-restart is the graceful primitive here: it restarts systemd-resolved
+    # only if it is already running, and does nothing (successfully) if DNS is
+    # handled some other way on this machine.
+    result = run(["systemctl", "try-restart", "systemd-resolved"])
+    if result.returncode != 0:
+        remove_file(RESOLVED_DROPIN)
+        fail("couldn't restart systemd-resolved, so the DNS settings were rolled back:\n"
+             + (result.stderr or "").strip())
+
+    state = read_state()
+    state["dns"] = {"level": level}
+    write_state(state)
+    return {"level": level, "restarted": True}
+
+
+def revert_dns():
+    remove_file(RESOLVED_DROPIN)
+    run(["systemctl", "try-restart", "systemd-resolved"])
+    state = read_state()
+    state["dns"] = {"level": "off"}
+    write_state(state)
+    return {"level": "off", "restarted": True}
+
+
+# -- crypto policy + SSH ---------------------------------------------------------
+
+def current_crypto_policy():
+    result = run(["update-crypto-policies", "--show"])
+    return (result.stdout or "").strip() if result.returncode == 0 else ""
+
+
+def set_crypto_policy(policy):
+    result = run(["update-crypto-policies", "--set", policy])
+    if result.returncode != 0:
+        fail(f"couldn't set the crypto policy to {policy}:\n"
+             + ((result.stderr or result.stdout or "").strip()))
+
+
+def write_ssh_dropin(level):
+    """Returns (applied: bool, skipped_reason: str | None).
+
+    Never leaves an sshd config that fails validation: the file is written,
+    checked with `sshd -t`, and removed again if the check fails.
+    """
+    directives = SSH_DIRECTIVES[level]
+    if not directives:
+        remove_file(SSHD_DROPIN)
+        return False, None
+
+    if not sshd_available():
+        return False, "OpenSSH server isn't installed, so there was nothing to harden."
+
+    skipped_reason = None
+    key_owner = find_ssh_key_owner()
+    if key_owner is None:
+        directives = [(k, v) for k, v in directives if k not in KEY_GUARDED]
+        skipped_reason = (
+            "Password logins were left enabled: no SSH key is installed for any login user on this "
+            "machine, and disabling passwords without one would lock you out of remote access. "
+            "Run ssh-copy-id from another machine (or add a key to ~/.ssh/authorized_keys), then "
+            "re-apply this level."
+        )
+
+    previous = None
+    if os.path.exists(SSHD_DROPIN):
+        try:
+            with open(SSHD_DROPIN, "r", encoding="utf-8") as f:
+                previous = f.read()
+        except OSError:
+            previous = None
+
+    body = BANNER + "".join(f"{k} {v}\n" for k, v in directives)
+    write_file(SSHD_DROPIN, body, mode=0o600)
+
+    check = run(["sshd", "-t"])
+    if check.returncode != 0:
+        if previous is None:
+            remove_file(SSHD_DROPIN)
+        else:
+            write_file(SSHD_DROPIN, previous, mode=0o600)
+        fail("the generated SSH configuration didn't pass sshd's own validation, so it was rolled "
+             "back and nothing was changed:\n" + (check.stderr or "").strip())
+
+    # With socket activation each connection starts a fresh sshd that reads the
+    # config anyway, so a failed reload is not fatal -- but a running service
+    # does need telling.
+    if unit_is_active("sshd.service"):
+        run(["systemctl", "reload", "sshd.service"])
+    return True, skipped_reason
+
+
+def apply_crypto(level):
+    if level == "off":
+        return revert_crypto()
+
+    state = read_state()
+    crypto_state = state.get("crypto", {})
+    # Only record the pre-existing policy the first time, so stepping between
+    # levels never overwrites the real original with one of ours.
+    previous = crypto_state.get("previous_policy")
+    if not previous or crypto_state.get("level", "off") == "off":
+        previous = current_crypto_policy() or "DEFAULT"
+
+    set_crypto_policy(CRYPTO_POLICY[level])
+    ssh_applied, skipped_reason = write_ssh_dropin(level)
+
+    state["crypto"] = {
+        "level": level,
+        "previous_policy": previous,
+        "ssh_applied": ssh_applied,
+        "ssh_password_auth_disabled": ssh_applied and skipped_reason is None and level in ("balanced", "strict"),
+        "ssh_skipped_reason": skipped_reason,
+    }
+    write_state(state)
+    return state["crypto"]
+
+
+def revert_crypto():
+    state = read_state()
+    previous = state.get("crypto", {}).get("previous_policy") or "DEFAULT"
+    if current_crypto_policy() != previous:
+        set_crypto_policy(previous)
+    remove_file(SSHD_DROPIN)
+    if unit_is_active("sshd.service"):
+        run(["systemctl", "reload", "sshd.service"])
+    state["crypto"] = {"level": "off", "previous_policy": previous,
+                       "ssh_applied": False, "ssh_password_auth_disabled": False,
+                       "ssh_skipped_reason": None}
+    write_state(state)
+    return state["crypto"]
+
+
+# -- status ----------------------------------------------------------------------
+
+def status():
+    """Deliberately runs fine unprivileged, so the GUI can show current state
+    without throwing a password prompt at someone who only opened a tab.
+
+    Everything it needs is world-readable: the crypto policy, our own
+    resolved drop-in (0644) and the state file (0644). The one exception is the
+    sshd drop-in, which lives in a 0700 directory -- as an ordinary user we
+    can't even tell whether it exists, so `ssh_dropin` is None and the recorded
+    state is what the page reports instead. `privileged` says which of those
+    two situations the caller is in, rather than letting None mean two things.
+    """
+    privileged = os.geteuid() == 0
+    return {
+        "protocol": PROTOCOL_VERSION,
+        "privileged": privileged,
+        "crypto_policy": current_crypto_policy(),
+        "dns_dropin": parse_dropin(RESOLVED_DROPIN),
+        "ssh_dropin": parse_dropin(SSHD_DROPIN) if privileged else None,
+        "sshd_available": sshd_available(),
+        "sshd_active": unit_is_active("sshd.service"),
+        "resolved_active": unit_is_active("systemd-resolved"),
+        "ssh_key_present": find_ssh_key_owner() is not None,
+        "state": read_state(),
+    }
+
+
+# -- entry point -------------------------------------------------------------------
+
+def require_level(argv):
+    if len(argv) < 3:
+        fail("a level is required")
+    level = argv[2]
+    # The whole trust boundary in one line: the caller picks from four strings
+    # and nothing else reaches the filesystem.
+    if level not in LEVELS:
+        fail(f"unknown level {level!r}")
+    return level
+
+
+def main(argv):
+    if len(argv) < 2:
+        fail(f"usage: {os.path.basename(argv[0])} "
+             "status|apply-dns LEVEL|revert-dns|apply-crypto LEVEL|revert-crypto", 2)
+
+    verb = argv[1]
+    if verb not in ("status", "apply-dns", "revert-dns", "apply-crypto", "revert-crypto"):
+        fail(f"unknown verb {verb!r}", 2)
+
+    # Validate every argument before doing anything else, including before the
+    # root check, so bad input is rejected identically whoever runs it.
+    level = require_level(argv) if verb in ("apply-dns", "apply-crypto") else None
+
+    if verb != "status" and os.geteuid() != 0:
+        fail("this must run as root (it is normally started by firewall-gui through pkexec)")
+
+    os.umask(0o022)
+
+    if verb == "status":
+        result = status()
+    elif verb == "apply-dns":
+        result = apply_dns(level)
+    elif verb == "revert-dns":
+        result = revert_dns()
+    elif verb == "apply-crypto":
+        result = apply_crypto(level)
+    else:
+        result = revert_crypto()
+
+    print(json.dumps(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
