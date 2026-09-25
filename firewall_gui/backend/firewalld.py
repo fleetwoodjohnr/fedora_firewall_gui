@@ -301,6 +301,25 @@ class FirewalldClient(GObject.Object):
 
         self._call(self._zone_proxy, "getZoneSettings2", GLib.Variant("(s)", (zone,)), on_result)
 
+    def get_permanent_zone_settings(self, zone, callback):
+        """Read the persistent zone configuration for write verification."""
+        def resolved(proxy, error):
+            if error or proxy is None:
+                callback(None, error or ValueError("zone configuration unavailable"))
+                return
+
+            def loaded(result, read_error):
+                if read_error:
+                    callback(None, read_error)
+                else:
+                    settings = dict(ZONE_SETTINGS_DEFAULTS)
+                    settings.update(result[0])
+                    callback(settings, None)
+
+            self._call(proxy, "getSettings2", None, loaded)
+
+        self._get_config_zone_proxy(zone, resolved)
+
     def change_zone_of_interface(self, zone, interface, callback):
         """Runtime-only, session-scoped move of an interface to a zone."""
         self._call(
@@ -310,6 +329,18 @@ class FirewalldClient(GObject.Object):
 
     def query_panic_mode(self, callback):
         self._call(self._root_proxy, "queryPanicMode", None, lambda r, e: callback(None if e else r[0], e))
+
+    def get_log_denied(self, callback):
+        self._call(self._root_proxy, "getLogDenied", None, lambda r, e: callback(None if e else r[0], e))
+
+    def set_log_denied(self, mode, callback):
+        if mode not in ("off", "unicast"):
+            callback(False, ValueError("unsupported logging mode"))
+            return
+        self._call(
+            self._root_proxy, "setLogDenied", GLib.Variant("(s)", (mode,)),
+            lambda r, e: callback(e is None, e),
+        )
 
     def set_panic_mode(self, enabled, callback):
         method = "enablePanicMode" if enabled else "disablePanicMode"

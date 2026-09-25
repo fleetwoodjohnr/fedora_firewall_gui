@@ -1,48 +1,52 @@
-/* firewall-gui stylesheet.
- *
- * Colours are libadwaita's semantic names (@success_bg_color and friends)
- * rather than literal hex, so light and dark themes and the user's accent
- * choice are all handled by the platform instead of by a second palette here.
- *
- * Colour is never the only signal on any control below: a switch still shows
- * its position and a level bar still shows its label, so this reads correctly
- * for colourblind users too.
- */
+/* Adaptive surfaces use libadwaita's palette in both light and dark modes. */
 
-/* --- Switches: green for on, red for off, everywhere in the app ----------
- *
- * Reaches both a bare Gtk.Switch and the one Adw.SwitchRow builds internally
- * (row > box.header > box.suffixes > switch).
- */
-switch {
-  background-color: @error_bg_color;
-  border-color: shade(@error_bg_color, 0.8);
+.page-intro {
+  padding: 12px 2px 4px;
 }
 
-switch:checked {
-  background-color: @success_bg_color;
-  border-color: shade(@success_bg_color, 0.8);
+.page-intro-icon {
+  color: @accent_color;
 }
 
-/* A switch that can't be operated shouldn't shout. Mid-apply and
- * helper-unavailable states both land here. */
+.metric-card {
+  min-width: 148px;
+  min-height: 108px;
+  padding: 16px;
+  border-radius: 14px;
+  background-color: @card_bg_color;
+  border: 1px solid alpha(@borders, 0.45);
+}
+
+.metric-card image {
+  color: @accent_color;
+}
+
+.activity-chart {
+  padding: 12px 8px;
+  border-radius: 14px;
+  background-color: @card_bg_color;
+  border: 1px solid alpha(@borders, 0.45);
+}
+
+.activity-bar {
+  min-width: 5px;
+  border-radius: 4px 4px 2px 2px;
+  background-color: @accent_bg_color;
+}
+
+.apply-controls {
+  margin: 2px 6px;
+}
+
+.apply-controls button {
+  min-height: 28px;
+}
+
+/* A disabled or unchecked switch is not necessarily a security problem. */
 switch:disabled {
-  background-color: alpha(@error_bg_color, 0.4);
-  border-color: alpha(@error_bg_color, 0.3);
+  opacity: 0.55;
 }
 
-switch:checked:disabled {
-  background-color: alpha(@success_bg_color, 0.4);
-  border-color: alpha(@success_bg_color, 0.3);
-}
-
-/* --- Hardening level bars: graded red -> amber -> green -------------------
- *
- * The class lives on the toggle-group and names the selected level. Adw
- * interleaves <separator> nodes between the <toggle> children, so :nth-child()
- * would count the separators as well -- driving the colour from a class on the
- * parent avoids that entirely.
- */
 toggle-group.level-off > toggle:checked {
   background-color: @error_bg_color;
   color: @error_fg_color;

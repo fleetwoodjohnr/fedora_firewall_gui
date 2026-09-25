@@ -4,6 +4,8 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk
 
+from .pending import ApplyControls, PendingValue
+
 RISK_STYLE = {"low": "success", "medium": "warning", "high": "error"}
 
 
@@ -11,13 +13,11 @@ class ServiceRow(Adw.ExpanderRow):
     """One service in the Zone Editor's list: a collapsed row with a risk dot
     and an on/off switch, expanding to show the curated explanation.
 
-    The switch never flips optimistically -- it uses GTK's state-set
-    mechanism, so the visible position only changes once the paired
-    runtime+permanent write actually succeeds (or is confirmed to have
-    failed), matching every other toggle in this app.
+    The switch previews a draft. Apply writes it to the runtime and permanent
+    zone settings; the row reports success only after both are read back.
     """
 
-    def __init__(self, name, info, enabled, on_toggle, on_result_error, on_first_expand=None):
+    def __init__(self, name, info, enabled, on_toggle, on_result_error, on_first_expand=None, model=None):
         super().__init__()
         self._name = name
         self.name = name
@@ -27,6 +27,8 @@ class ServiceRow(Adw.ExpanderRow):
         self._on_first_expand = on_first_expand
         self._expanded_once = False
         self._syncing = False
+        self._model = model or PendingValue(enabled)
+        self._model.observe(enabled)
 
         self.set_title(info.label)
         self.set_subtitle(info.summary)
@@ -38,10 +40,11 @@ class ServiceRow(Adw.ExpanderRow):
         self.add_prefix(dot)
 
         self._switch = Gtk.Switch(valign=Gtk.Align.CENTER)
-        self._switch.set_active(enabled)
-        self._switch.set_state(enabled)
-        self._switch.connect("state-set", self._on_state_set)
+        self._switch.connect("notify::active", self._on_active_changed)
         self.add_suffix(self._switch)
+        self._controls = ApplyControls(self._model, self._apply)
+        self.add_suffix(self._controls)
+        self._listener = self._model.connect(self._sync_switch)
 
         self._recommendation_label = Gtk.Label(
             label=f"{info.recommendation}\n\nCategory: {info.category}",
@@ -62,9 +65,16 @@ class ServiceRow(Adw.ExpanderRow):
 
     def set_enabled(self, enabled):
         """Sync the row to backend state without triggering a write."""
+        self._model.observe(enabled)
+
+    def detach(self):
+        self._model.disconnect(self._listener)
+        self._controls.detach()
+
+    def _sync_switch(self, model):
         self._syncing = True
-        self._switch.set_state(enabled)
-        self._switch.set_active(enabled)
+        self._switch.set_state(bool(model.draft))
+        self._switch.set_active(bool(model.draft))
         self._syncing = False
 
     def set_detail_text(self, summary, recommendation_text):
@@ -82,30 +92,14 @@ class ServiceRow(Adw.ExpanderRow):
         query = query.lower()
         return query in self._name.lower() or query in self.info.label.lower() or query in self.info.summary.lower()
 
-    def _on_state_set(self, switch, requested_state):
-        # gtk_switch_set_active() re-emits ::state-set, so any code path that
-        # moves `active` has to be guarded. On a *failed* toggle `active` holds
-        # the user's request while `state` still holds the old value, so putting
-        # `active` back below genuinely changes it -- and without this guard that
-        # re-entered here and issued a second, opposite firewalld write the user
-        # never asked for (and a second PolicyKit prompt with it).
-        if self._syncing:
-            return True
+    def _on_active_changed(self, switch, _pspec):
+        if not self._syncing:
+            self._model.stage(switch.get_active())
 
-        switch.set_sensitive(False)
-
+    def _apply(self, requested_state, done):
         def on_result(ok, error, partial):
-            switch.set_sensitive(True)
-            self._syncing = True
-            if ok:
-                switch.set_state(requested_state)
-                switch.set_active(requested_state)
-            else:
-                switch.set_state(switch.get_state())
-                switch.set_active(switch.get_state())
-            self._syncing = False
             if error is not None or partial:
                 self._on_result_error(self._name, requested_state, error, partial)
+            done(ok and not partial, error or ("runtime and saved rules differ" if partial else None))
 
         self._on_toggle(self._name, requested_state, on_result)
-        return True

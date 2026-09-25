@@ -18,6 +18,10 @@ class NmcliPermissionDenied(NmcliError):
     """nmcli reported insufficient privileges to modify a connection."""
 
 
+class ProtonVpnError(FirewallGuiError):
+    """Proton VPN diagnostics or a supported repair command failed."""
+
+
 def translate_dbus_error(err) -> FirewallGuiError:
     """Classify a GLib.Error raised by a firewalld D-Bus call.
 

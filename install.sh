@@ -137,6 +137,8 @@ install_update_timer() {
 # /usr/libexec rather than left in ~/.local on purpose -- pkexec runs it as
 # root, and root must never execute a file that a compromised user account
 # could rewrite first.
+# The same optional helper provides a bounded, aggregate-only journal report
+# when the account cannot read kernel logs directly.
 install_privileged_helper() {
     local src_dir="$1"
 
@@ -166,7 +168,8 @@ install_privileged_helper() {
     if [[ -z "${FIREWALL_GUI_HELPER:-}" ]]; then
         echo
         echo "The Hardening page can also manage your DNS privacy settings, the system-wide"
-        echo "crypto policy, and SSH hardening. Those need a small helper installed as root:"
+        echo "crypto policy, and SSH hardening, and Dashboard activity can read restricted"
+        echo "kernel logs as aggregate counts. Those need a small helper installed as root:"
         echo "  $HELPER_PATH"
         echo "  $POLKIT_ACTION_PATH"
         echo "Everything else in the app works without it."
@@ -202,9 +205,9 @@ print_summary() {
     echo "  App source:    $SHARE_DIR/firewall_gui"
     echo "  Checkout:      $src_dir"
     if [[ -x "$HELPER_PATH" && -f "$POLKIT_ACTION_PATH" ]]; then
-        echo "  Hardening:     system helper installed ($HELPER_PATH)"
+        echo "  Helper:        hardening and activity helper installed ($HELPER_PATH)"
     else
-        echo "  Hardening:     system helper not installed — DNS/encryption levels will be unavailable"
+        echo "  Helper:        not installed — DNS/encryption levels and restricted-journal activity unavailable"
     fi
     if require_cmd systemctl && systemctl --user is-enabled --quiet firewall-gui-update.timer 2>/dev/null; then
         echo "  Auto-update:   checks for updates every 30 minutes (systemctl --user status firewall-gui-update.timer)"

@@ -12,7 +12,7 @@ def escape_markup(text):
     return GLib.markup_escape_text(str(text))
 
 
-def confirm(parent, heading, body, confirm_label, on_confirm, destructive=True):
+def confirm(parent, heading, body, confirm_label, on_confirm, destructive=True, on_cancel=None):
     """Show a Cancel/Confirm Adw.AlertDialog. `on_confirm` is called with no
     arguments only if the user picks the confirm response."""
     dialog = Adw.AlertDialog.new(heading, body)
@@ -27,6 +27,8 @@ def confirm(parent, heading, body, confirm_label, on_confirm, destructive=True):
     def on_response(source, result, _data=None):
         if dialog.choose_finish(result) == "confirm":
             on_confirm()
+        elif on_cancel is not None:
+            on_cancel()
 
     dialog.choose(parent, None, on_response, None)
 

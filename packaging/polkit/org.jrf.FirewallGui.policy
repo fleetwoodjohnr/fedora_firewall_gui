@@ -14,13 +14,16 @@
     drop-in. Reading current state needs no action at all - the helper's
     `status` verb runs unprivileged, so simply opening the page never prompts.
 
+    It also permits a bounded, aggregate-only read of denied-packet activity
+    when the ordinary user cannot read the kernel journal.
+
     auth_admin_keep, not auth_admin: applying a hardening level makes several
     changes in a row, and prompting separately for each would train people to
     click through password dialogs without reading them.
   -->
   <action id="org.jrf.FirewallGui.apply-hardening">
-    <description>Change system hardening settings</description>
-    <message>Authentication is required to change this system's DNS, encryption, and SSH hardening settings.</message>
+    <description>Manage firewall hardening and read activity totals</description>
+    <message>Authentication is required to change DNS, encryption, or SSH hardening, or to read aggregate firewall activity when journal access is restricted.</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>

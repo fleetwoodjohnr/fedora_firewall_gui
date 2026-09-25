@@ -43,10 +43,10 @@ def _split_terse_line(line):
 
 
 class NetworkManagerClient:
-    """Thin async wrapper around `nmcli`, used only for the per-connection
-    `connection.zone` property that ties a saved network to a firewalld zone.
-    All calls run via Gio.Subprocess (argv list, never a shell) so they never
-    block the GTK main loop.
+    """Thin async wrapper around the NetworkManager settings used by the app.
+
+    All calls run via Gio.Subprocess (argv list, never a shell) so connection
+    status, zone, and DNS operations never block the GTK main loop.
     """
 
     def _run(self, args, callback):
@@ -118,6 +118,24 @@ class NetworkManagerClient:
             callback(connections, None)
 
         self._run(["-t", "-f", ",".join(CONNECTION_FIELDS), "connection", "show", "--active"], on_result)
+
+    def get_connectivity(self, callback):
+        """callback({state, connectivity}: dict | None, error)
+
+        `connectivity` is NetworkManager's own reachability result (none,
+        portal, limited, full, or unknown).  It is preferable to making this
+        app phone a new third-party test endpoint merely to check the VPN.
+        """
+
+        def on_result(stdout, error):
+            if error:
+                callback(None, error)
+                return
+            fields = _split_terse_line((stdout or "").strip())
+            fields += ["unknown", "unknown"]
+            callback({"state": fields[0], "connectivity": fields[1]}, None)
+
+        self._run(["-t", "-f", "STATE,CONNECTIVITY", "general", "status"], on_result)
 
     def get_connection_zone(self, uuid, callback):
         """callback(zone: str, error) -- zone is "" when unset."""

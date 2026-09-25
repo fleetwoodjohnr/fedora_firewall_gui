@@ -5,6 +5,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk
 
 from .confirm import escape_markup
+from .pending import ApplyControls, PendingValue
 
 # Adw.ToggleGroup arrived in libadwaita 1.7. Fedora 41/42 ship 1.6, and this app
 # is installed from a git checkout onto whatever the machine already has, so it
@@ -19,13 +20,8 @@ class LevelSelector(Gtk.Box):
     The description below the control is the reason this widget exists. Picking
     "Strict" out of a dropdown tells you nothing; the point is to read what it
     turns on and what it will break *before* you commit to it. So clicking a
-    notch doesn't apply anything -- it swaps the description to that level and
-    asks for confirmation, and the control only moves once the change has
-    actually landed.
-
-    That last part is the same non-optimistic rule every other control in this
-    app follows (see widgets/service_row.py and the Panic Mode switch): the
-    visible position always reflects the system, never the request.
+    notch previews its consequences. Apply asks for confirmation, then reports
+    the result after the change has been checked against system state.
     """
 
     def __init__(self, levels, on_apply, window, confirm_heading):
@@ -44,6 +40,11 @@ class LevelSelector(Gtk.Box):
         self._description = Gtk.Label(wrap=True, xalign=0, use_markup=True)
         self._description.add_css_class("dim-label")
         self.append(self._description)
+
+        self._pending = PendingValue(self._levels[0].id)
+        self._controls = ApplyControls(self._pending, self._apply_pending)
+        self.append(self._controls)
+        self._pending.connect(self._sync_pending)
 
         self._show_description(0)
         self._sync_level_class()
@@ -116,41 +117,38 @@ class LevelSelector(Gtk.Box):
         # the click silently does nothing, so check rather than let it happen.
         if index < 0 or index >= len(self._levels):
             return
-        if index == self._active_index:
-            return
-        level = self._levels[index]
+        self._pending.stage(self._levels[index].id)
 
-        # Show what they just clicked on straight away, so the confirmation
-        # dialog isn't the first place they read it -- then put the control back
-        # where the system actually is until the change succeeds.
-        self._show_description(index)
-        self._set_index(self._active_index)
+    def _sync_pending(self, model):
+        self._active_index = next(
+            (i for i, level in enumerate(self._levels) if level.id == model.applied), 0
+        )
+        preview_index = next(
+            (i for i, level in enumerate(self._levels) if level.id == model.draft), self._active_index
+        )
+        self._set_index(preview_index)
+        self._show_description(preview_index)
+        self._sync_level_class()
+
+    def _apply_pending(self, level_id, done):
+        level = next(level for level in self._levels if level.id == level_id)
 
         def apply():
             self._set_sensitive_during_apply(False)
 
-            def done(ok, error):
+            def finished(ok, error):
                 self._set_sensitive_during_apply(True)
-                if ok:
-                    self._active_index = index
-                    self._set_index(index)
-                    self._show_description(index)
-                    self._sync_level_class()
-                else:
-                    self._show_description(self._active_index)
+                done(ok, error)
 
-            self._on_apply(level, done)
-
-        def cancelled():
-            self._show_description(self._active_index)
+            self._on_apply(level, finished)
 
         confirm_dialog(
             self._window,
             f"{self._confirm_heading}: {level.label}?",
             f"{level.detail}\n\nWhat this might break:\n{level.breaks}",
-            f"Switch to {level.label}",
+            f"Apply {level.label}",
             apply,
-            cancelled,
+            lambda: done(False, "Still pending"),
             destructive=level.id == "strict",
         )
 
@@ -188,17 +186,9 @@ class LevelSelector(Gtk.Box):
     def set_active_level(self, level_id):
         """Point the control at what the system actually reports, without
         applying anything. Used on load and whenever status is re-read."""
-        for index, level in enumerate(self._levels):
-            if level.id == level_id:
-                self._active_index = index
-                self._set_index(index)
-                self._show_description(index)
-                self._sync_level_class()
-                return
-        self._active_index = 0
-        self._set_index(0)
-        self._show_description(0)
-        self._sync_level_class()
+        if level_id not in {level.id for level in self._levels}:
+            level_id = self._levels[0].id
+        self._pending.observe(level_id)
 
     def get_active_level(self):
         return self._levels[self._active_index]

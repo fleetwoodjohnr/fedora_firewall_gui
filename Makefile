@@ -1,4 +1,7 @@
-.PHONY: install uninstall purge update reinstall
+.PHONY: install uninstall purge update reinstall test
+
+test:
+	python3 -m unittest discover -s tests
 
 install:
 	./install.sh

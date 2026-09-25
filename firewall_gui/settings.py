@@ -12,6 +12,7 @@ SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
 
 class AppSettings(GObject.Object):
     show_all_zones = GObject.Property(type=bool, default=False)
+    monitoring_owned = GObject.Property(type=bool, default=False)
 
     # Which resolver the Hardening page pins, and on which saved connections.
     # Both are app-side preferences: the system state itself lives in
@@ -33,6 +34,7 @@ class AppSettings(GObject.Object):
     # means adding one line here and one GObject.Property above.
     _KEYS = {
         "show_all_zones": False,
+        "monitoring_owned": False,
         "dns_provider": "automatic",
         "dns_pinned_uuids": "[]",
         "encryption_removed_services": "[]",
@@ -66,13 +68,34 @@ class AppSettings(GObject.Object):
 
     def _save(self):
         try:
-            os.makedirs(SETTINGS_DIR, exist_ok=True)
-            tmp_path = SETTINGS_PATH + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump({name: getattr(self, name) for name in self._KEYS}, f, indent=2)
-            os.replace(tmp_path, SETTINGS_PATH)
+            self._write_data({name: getattr(self, name) for name in self._KEYS})
         except OSError:
             pass
+
+    @staticmethod
+    def _write_data(data):
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        tmp_path = SETTINGS_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, SETTINGS_PATH)
+
+    def apply(self, name, value):
+        """Persist a UI preference before reporting it applied to its control."""
+        if name not in self._KEYS:
+            return False, f"unknown preference: {name}"
+        data = {key: getattr(self, key) for key in self._KEYS}
+        data[name] = value
+        try:
+            self._write_data(data)
+        except OSError as error:
+            return False, error
+        self._loading = True
+        try:
+            setattr(self, name, value)
+        finally:
+            self._loading = False
+        return True, None
 
     # -- JSON-backed list accessors ---------------------------------------------
 

@@ -1,3 +1,4 @@
+import json
 import os
 
 import gi
@@ -22,12 +23,14 @@ from ..data.encryption_levels import (
 from ..widgets.debounce import Debouncer
 from ..widgets.confirm import confirm, escape_markup, show_error_toast, show_toast
 from ..widgets.level_selector import LevelSelector
-from ..widgets.state_switch import StateBackedSwitch
+from ..widgets.pending import ApplyControls, PendingValue
+from ..widgets.page_intro import page_intro
 
 # How each DNS level wants NetworkManager's per-connection dns-over-tls set on a
 # connection with a pinned resolver. "" means "leave it at the default", which
 # lets the global systemd-resolved setting decide.
 DOT_FOR_LEVEL = {"off": "", "basic": "opportunistic", "balanced": "opportunistic", "strict": "yes"}
+DOT_READBACK = {"": {"-1", "default", ""}, "opportunistic": {"1", "opportunistic"}, "yes": {"2", "yes"}}
 
 
 def _card(child):
@@ -76,8 +79,11 @@ class HardeningPage(Adw.PreferencesPage):
         self._default_zone = None
         self._zone_services = set()
         self._connection_rows = {}
+        self._pin_models = {}
         self._provider_syncing = False
         self._sshd_state = None
+
+        self.add(page_intro("Hardening", "Tune DNS, encryption, and remote access with the effect of each choice visible before Apply.", "channel-secure-symbolic"))
 
         self._build_helper_group()
         self._build_dns_group()
@@ -166,6 +172,10 @@ class HardeningPage(Adw.PreferencesPage):
             title="Answer my lookups with",
             model=Gtk.StringList.new([p.label for p in DNS_PROVIDERS]),
         )
+        self._provider_model = PendingValue(self._settings.dns_provider)
+        self._provider_combo.add_suffix(
+            ApplyControls(self._provider_model, self._apply_provider)
+        )
         self._provider_combo.connect("notify::selected", self._on_provider_selected)
         self._resolver_group.add(self._provider_combo)
 
@@ -181,10 +191,14 @@ class HardeningPage(Adw.PreferencesPage):
         self._connections_header.set_subtitle_lines(0)
         self._resolver_group.add(self._connections_header)
 
+        self._provider_model.connect(self._sync_provider_model)
         self._sync_provider_combo()
 
     def _sync_provider_combo(self):
-        provider = get_dns_provider(self._settings.dns_provider)
+        self._provider_model.observe(self._settings.dns_provider)
+
+    def _sync_provider_model(self, model):
+        provider = get_dns_provider(model.draft)
         index = next((i for i, p in enumerate(DNS_PROVIDERS) if p.id == provider.id), 0)
         self._provider_syncing = True
         self._provider_combo.set_selected(index)
@@ -194,7 +208,7 @@ class HardeningPage(Adw.PreferencesPage):
     def _show_provider_detail(self, provider):
         self._provider_detail.set_title(provider.label)
         self._provider_detail.set_subtitle(escape_markup(provider.detail))
-        pinnable = provider.id != "automatic"
+        pinnable = provider.id != "automatic" and not self._provider_model.dirty
         self._connections_header.set_sensitive(pinnable)
         for entry in self._connection_rows.values():
             entry["row"].set_sensitive(pinnable)
@@ -210,6 +224,11 @@ class HardeningPage(Adw.PreferencesPage):
         loud is the same rule the rest of this page follows: report what the
         system is doing, not what was asked for.
         """
+        if self._provider_model.dirty:
+            self._connections_header.set_subtitle(
+                "Resolver change pending. Apply it before editing network assignments."
+            )
+            return
         provider = get_dns_provider(self._settings.dns_provider)
         if provider.id == "automatic":
             self._connections_header.remove_css_class("warning")
@@ -241,20 +260,52 @@ class HardeningPage(Adw.PreferencesPage):
     def _on_provider_selected(self, combo, _pspec):
         if self._provider_syncing:
             return
-        provider = DNS_PROVIDERS[combo.get_selected()]
-        self._settings.dns_provider = provider.id
-        self._show_provider_detail(provider)
-
-        # Re-point every already-pinned network at the new resolver, so the
-        # picker never leaves connections quietly pinned to the previous one.
-        pinned = self._settings.get_pinned_uuids()
-        if not pinned:
+        index = combo.get_selected()
+        if not 0 <= index < len(DNS_PROVIDERS):
             return
-        self._pin_connections(pinned, provider, unpin=provider.id == "automatic")
+        self._provider_model.stage(DNS_PROVIDERS[index].id)
+
+    def _apply_provider(self, provider_id, done):
+        provider = get_dns_provider(provider_id)
+        pinned = self._settings.get_pinned_uuids()
+
+        def persist():
+            ok, error = self._settings.apply("dns_provider", provider_id)
+            if not ok:
+                done(False, error)
+                return
+            if provider_id == "automatic":
+                ok, error = self._settings.apply("dns_pinned_uuids", "[]")
+                if not ok:
+                    done(False, error)
+                    return
+            done(True)
+            self._refresh_connections()
+            show_toast(self._window.toast_overlay, f"Resolver {provider.label} applied.")
+
+        if not pinned:
+            persist()
+            return
+        state = {"remaining": len(pinned), "errors": []}
+
+        def one(ok, error):
+            if not ok:
+                state["errors"].append(str(error or "network update failed"))
+            state["remaining"] -= 1
+            if not state["remaining"]:
+                if state["errors"]:
+                    done(False, "; ".join(state["errors"]))
+                else:
+                    persist()
+
+        for uuid in pinned:
+            self._pin_one(uuid, provider, unpin=provider_id == "automatic", callback=one)
 
     def _refresh_connections(self):
         def on_connections(connections, error):
             for entry in self._connection_rows.values():
+                entry["model"].disconnect(entry["listener"])
+                entry["controls"].detach()
                 self._resolver_group.remove(entry["row"])
             self._connection_rows.clear()
             if error is not None:
@@ -279,72 +330,96 @@ class HardeningPage(Adw.PreferencesPage):
 
         row = Adw.SwitchRow(title=escape_markup(conn["name"]), subtitle=subtitle)
         row.set_subtitle_lines(0)
-        row.set_sensitive(provider.id != "automatic")
+        row.set_sensitive(provider.id != "automatic" and not self._provider_model.dirty)
         uuid = conn["uuid"]
-        switch = StateBackedSwitch(
-            row, lambda wanted, done, u=uuid: self._request_pin(u, wanted, done)
-        )
-        switch.set_applied(pinned)
+        model = self._pin_models.setdefault(uuid, PendingValue(pinned))
+        model.observe(pinned)
+        state = {"syncing": False}
+
+        def sync(value):
+            state["syncing"] = True
+            row.set_active(bool(value.draft))
+            state["syncing"] = False
+
+        def changed(widget, _pspec):
+            if not state["syncing"]:
+                model.stage(widget.get_active())
+
+        listener = model.connect(sync)
+        row.connect("notify::active", changed)
+        controls = ApplyControls(model, lambda wanted, done, u=uuid: self._request_pin(u, wanted, done))
+        row.add_suffix(controls)
         self._resolver_group.add(row)
-        self._connection_rows[uuid] = {"row": row, "conn": conn, "switch": switch}
+        self._connection_rows[uuid] = {"row": row, "conn": conn, "model": model,
+                                       "listener": listener, "controls": controls}
 
     def _request_pin(self, uuid, wanted, done):
-        """Called by StateBackedSwitch only for a real user request."""
+        """Apply a staged resolver assignment to one saved network."""
         entry = self._connection_rows.get(uuid)
         if entry is None:
+            done(False, "Network profile is no longer available")
             return
         row = entry["row"]
         provider = get_dns_provider(self._settings.dns_provider)
         row.set_sensitive(False)
 
         def finished(ok, error):
-            row.set_sensitive(provider.id != "automatic")
             if not ok:
+                row.set_sensitive(provider.id != "automatic" and not self._provider_model.dirty)
                 show_error_toast(self._window.toast_overlay, error, "Couldn't change this network's DNS")
-                done(False)
+                done(False, error)
                 return
-            pinned = set(self._settings.get_pinned_uuids())
-            pinned.add(uuid) if wanted else pinned.discard(uuid)
-            self._settings.set_pinned_uuids(pinned)
-            done(True)
-            self._update_pin_summary()
+            def verified(values, read_error):
+                row.set_sensitive(provider.id != "automatic" and not self._provider_model.dirty)
+                if read_error or values is None:
+                    done(False, read_error or "could not verify DNS settings")
+                    return
+                ipv4, ipv6 = provider_dns_values(provider) if wanted else ("", "")
+                def addresses(raw):
+                    return {part.strip() for part in raw.split(",") if part.strip()}
+
+                if addresses(values["ipv4"]) != addresses(ipv4) or addresses(values["ipv6"]) != addresses(ipv6):
+                    done(False, "saved DNS servers did not match")
+                    return
+                pinned = set(self._settings.get_pinned_uuids())
+                pinned.add(uuid) if wanted else pinned.discard(uuid)
+                saved, save_error = self._settings.apply("dns_pinned_uuids", json.dumps(sorted(pinned)))
+                done(saved, save_error)
+                self._update_pin_summary()
+
+            self._nm.get_connection_dns(uuid, verified)
 
         self._pin_one(uuid, provider, unpin=not wanted, callback=finished)
 
-    def _pin_one(self, uuid, provider, unpin, callback):
-        if unpin:
-            self._nm.set_connection_dns(uuid, "", "", "", callback)
-            return
-        ipv4, ipv6 = provider_dns_values(provider)
-        level_id = self._dns_selector.get_active_level().id
-        self._nm.set_connection_dns(uuid, ipv4, ipv6, DOT_FOR_LEVEL.get(level_id, ""), callback)
+    def _pin_one(self, uuid, provider, unpin, callback, level_id=None):
+        ipv4, ipv6 = ("", "") if unpin else provider_dns_values(provider)
+        level_id = level_id or self._dns_selector.get_active_level().id
+        dot = "" if unpin else DOT_FOR_LEVEL.get(level_id, "")
 
-    def _pin_connections(self, uuids, provider, unpin=False):
-        """Fan out across several connections and report once, using the same
-        countdown accumulator as the Dashboard's hardening rules."""
-        uuids = list(uuids)
-        if not uuids:
-            return
-        state = {"pending": len(uuids), "errors": []}
+        def written(ok, error):
+            if not ok:
+                callback(False, error)
+                return
 
-        def on_one(ok, error):
-            state["pending"] -= 1
-            if not ok and error is not None:
-                state["errors"].append(str(error))
-            if state["pending"] == 0:
-                if state["errors"]:
-                    show_error_toast(
-                        self._window.toast_overlay, "; ".join(state["errors"]), "Some networks failed"
-                    )
+            def read(values, read_error):
+                if read_error or values is None:
+                    callback(False, read_error or "DNS readback unavailable")
+                    return
+                def addresses(raw):
+                    return {part.strip() for part in raw.split(",") if part.strip()}
+
+                if addresses(values["ipv4"]) != addresses(ipv4) or addresses(values["ipv6"]) != addresses(ipv6):
+                    callback(False, "saved DNS servers did not match")
+                elif values["ignore_auto"] != (not unpin):
+                    callback(False, "saved automatic-DNS setting did not match")
+                elif str(values["dns_over_tls"]).strip().lower() not in DOT_READBACK[dot]:
+                    callback(False, "saved DNS-over-TLS setting did not match")
                 else:
-                    what = "Resolver unpinned." if unpin else f"Now using {provider.label.split(' — ')[0]}."
-                    show_toast(self._window.toast_overlay, what)
-                if unpin:
-                    self._settings.set_pinned_uuids([])
-                self._refresh_connections()
+                    callback(True, None)
 
-        for uuid in uuids:
-            self._pin_one(uuid, provider, unpin, on_one)
+            self._nm.get_connection_dns(uuid, read)
+
+        self._nm.set_connection_dns(uuid, ipv4, ipv6, dot, written)
 
     def _apply_dns_level(self, level, done):
         """Called by the LevelSelector once the user has confirmed."""
@@ -354,16 +429,38 @@ class HardeningPage(Adw.PreferencesPage):
                 show_error_toast(self._window.toast_overlay, error, "Couldn't change DNS hardening")
                 done(False, error)
                 return
-            show_toast(self._window.toast_overlay, f"DNS hardening set to {level.label}.")
-            done(True, None)
-            self._refresh_status()
-            # The per-connection DNS-over-TLS setting follows the level, so any
-            # pinned network needs rewriting to match.
-            pinned = self._settings.get_pinned_uuids()
-            provider = get_dns_provider(self._settings.dns_provider)
-            if pinned and provider.id != "automatic":
+
+            def verified(status, read_error):
+                actual = (status or {}).get("state", {}).get("dns", {}).get("level", "off")
+                if read_error or actual != level.id:
+                    done(False, read_error or f"helper still reports {actual}")
+                    return
+                pinned = self._settings.get_pinned_uuids()
+                provider = get_dns_provider(self._settings.dns_provider)
+                if not pinned or provider.id == "automatic":
+                    finish(True, None)
+                    return
+                state = {"remaining": len(pinned), "errors": []}
+
+                def one(pin_ok, pin_error):
+                    if not pin_ok:
+                        state["errors"].append(str(pin_error or "DNS update failed"))
+                    state["remaining"] -= 1
+                    if not state["remaining"]:
+                        finish(not state["errors"], "; ".join(state["errors"]) or None)
+
                 for uuid in pinned:
-                    self._pin_one(uuid, provider, unpin=False, callback=lambda *_a: None)
+                    self._pin_one(uuid, provider, unpin=False, callback=one, level_id=level.id)
+
+            self._hardening.get_status(verified)
+
+        def finish(ok, error):
+            if ok:
+                show_toast(self._window.toast_overlay, f"DNS hardening set to {level.label}.")
+            else:
+                show_error_toast(self._window.toast_overlay, error, "DNS level only partly applied")
+            done(ok, error)
+            self._refresh_status()
 
         self._hardening.apply_dns(level.id, on_helper)
 
@@ -392,7 +489,11 @@ class HardeningPage(Adw.PreferencesPage):
             subtitle="Checking…",
         )
         self._sshd_row.set_subtitle_lines(0)
-        self._sshd_switch = StateBackedSwitch(self._sshd_row, self._request_sshd)
+        self._sshd_model = PendingValue()
+        self._sshd_syncing = False
+        self._sshd_model.connect(self._sync_sshd_row)
+        self._sshd_row.connect("notify::active", self._on_sshd_selected)
+        self._sshd_row.add_suffix(ApplyControls(self._sshd_model, self._request_sshd))
         group.add(self._sshd_row)
 
         self._ssh_row = Adw.ActionRow(title="SSH hardening", subtitle="Checking…")
@@ -409,6 +510,15 @@ class HardeningPage(Adw.PreferencesPage):
             row.set_subtitle_lines(0)
             notes.add(row)
         self.add(notes)
+
+    def _sync_sshd_row(self, model):
+        self._sshd_syncing = True
+        self._sshd_row.set_active(bool(model.draft))
+        self._sshd_syncing = False
+
+    def _on_sshd_selected(self, row, _pspec):
+        if not self._sshd_syncing:
+            self._sshd_model.stage(row.get_active())
 
     def _refresh_zone_services(self):
         def on_default_zone(zone, error):
@@ -473,21 +583,57 @@ class HardeningPage(Adw.PreferencesPage):
             if state["errors"]:
                 show_error_toast(self._window.toast_overlay, "; ".join(state["errors"]), "Some steps failed")
                 done(False, "; ".join(state["errors"]))
-            else:
-                self._settings.set_removed_services((already_removed | set(to_remove)) - set(to_restore))
-                show_toast(
-                    self._window.toast_overlay,
-                    f"Encryption hardening set to {level.label}."
-                    + (" Reboot when convenient." if level.crypto_policy else ""),
-                )
-                done(True, None)
-            self._refresh_status()
-            self._refresh_zone_services()
+                self._refresh_status()
+                self._refresh_zone_services()
+                return
+
+            checks = {"remaining": 3, "errors": []}
+
+            def check_done():
+                checks["remaining"] -= 1
+                if checks["remaining"]:
+                    return
+                if checks["errors"]:
+                    reason = "; ".join(checks["errors"])
+                    show_error_toast(self._window.toast_overlay, reason, "Could not verify hardening")
+                    done(False, reason)
+                else:
+                    remembered = sorted((already_removed | set(to_remove)) - set(to_restore))
+                    saved, save_error = self._settings.apply("encryption_removed_services", json.dumps(remembered))
+                    if not saved:
+                        done(False, save_error)
+                    else:
+                        show_toast(
+                            self._window.toast_overlay,
+                            f"Encryption hardening set to {level.label}."
+                            + (" Reboot when convenient." if level.crypto_policy else ""),
+                        )
+                        done(True, None)
+                self._refresh_status()
+                self._refresh_zone_services()
+
+            def check_helper(status, error):
+                actual = (status or {}).get("state", {}).get("crypto", {}).get("level", "off")
+                if error or actual != level.id:
+                    checks["errors"].append(str(error or f"helper still reports {actual}"))
+                check_done()
+
+            def check_zone(settings, error):
+                services = set((settings or {}).get("services", []))
+                if error or settings is None:
+                    checks["errors"].append(str(error or "zone settings unavailable"))
+                elif any(s in services for s in to_remove) or any(s not in services for s in to_restore):
+                    checks["errors"].append("zone services did not match the requested level")
+                check_done()
+
+            self._hardening.get_status(check_helper)
+            self._fw.get_zone_settings(zone, check_zone)
+            self._fw.get_permanent_zone_settings(zone, check_zone)
 
         def on_step(ok, error, _partial=False):
             state["pending"] -= 1
-            if not ok and error is not None:
-                state["errors"].append(str(error))
+            if not ok or _partial:
+                state["errors"].append(str(error or "runtime and saved rules differ"))
             if state["pending"] == 0:
                 finish()
 
@@ -528,7 +674,7 @@ class HardeningPage(Adw.PreferencesPage):
                     self._sshd_row.set_subtitle(f"Couldn't read the SSH server's state: {state_error}")
                     return
                 self._sshd_state = state
-                self._sshd_switch.set_applied(state["enabled"] or state["active"])
+                self._sshd_model.observe(state["enabled"] or state["active"])
                 self._update_sshd_row()
 
             self._systemd.get_service_state(self.SSHD_UNIT, on_state)
@@ -577,7 +723,7 @@ class HardeningPage(Adw.PreferencesPage):
             self._sshd_row.remove_css_class("warning")
 
     def _request_sshd(self, wanted, done):
-        """Called by StateBackedSwitch only for a real user request."""
+        """Apply a staged SSH server setting and verify systemd state."""
         row = self._sshd_row
 
         def apply():
@@ -585,15 +731,34 @@ class HardeningPage(Adw.PreferencesPage):
 
             def finished(ok, error):
                 row.set_sensitive(True)
-                if ok:
-                    show_toast(
-                        self._window.toast_overlay,
-                        "SSH server turned on." if wanted else "SSH server turned off.",
-                    )
-                else:
+                if not ok:
                     show_error_toast(self._window.toast_overlay, error, "Couldn't change the SSH server")
-                done(ok)
-                self._refresh_sshd()
+                    done(False, error)
+                    self._refresh_sshd()
+                    return
+
+                def verified(state, read_error):
+                    correct = state and (state["enabled"] and state["active"] if wanted else
+                                         not state["enabled"] and not state["active"])
+                    if read_error or not correct:
+                        done(False, read_error or "systemd state did not match")
+                    elif wanted:
+                        done(True)
+                        show_toast(self._window.toast_overlay, "SSH server setting applied.")
+                    else:
+                        def socket_checked(socket_state, socket_error):
+                            if socket_error or socket_state is None or socket_state["enabled"] or socket_state["active"]:
+                                done(False, socket_error or "SSH socket is still enabled or active")
+                            else:
+                                done(True)
+                                show_toast(self._window.toast_overlay, "SSH server setting applied.")
+                            self._refresh_sshd()
+
+                        self._systemd.get_service_state(self.SSHD_ALSO[0], socket_checked)
+                        return
+                    self._refresh_sshd()
+
+                self._systemd.get_service_state(self.SSHD_UNIT, verified)
 
             self._systemd.set_service_enabled(
                 self.SSHD_UNIT, wanted, also_disable=() if wanted else self.SSHD_ALSO, callback=finished
@@ -612,7 +777,10 @@ class HardeningPage(Adw.PreferencesPage):
                     "account password. Add a key first (ssh-copy-id from the machine you'll connect from) "
                     "and the encryption levels above can then switch password logins off entirely."
                 )
-            confirm(self._window, "Turn on the SSH server?", body, "Turn It On", apply, destructive=True)
+            confirm(
+                self._window, "Turn on the SSH server?", body, "Turn It On", apply,
+                destructive=True, on_cancel=lambda: done(False, "Still pending"),
+            )
         else:
             confirm(
                 self._window,
@@ -625,6 +793,7 @@ class HardeningPage(Adw.PreferencesPage):
                 "Turn It Off",
                 apply,
                 destructive=False,
+                on_cancel=lambda: done(False, "Still pending"),
             )
 
     # -- Status ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@ HELPER_PATH = "/usr/libexec/firewall-gui-helper"
 # updates itself from git on a user timer, but the helper lives in /usr/libexec
 # and can only be replaced with sudo, so the two will drift apart eventually.
 # Detecting that is much better than misreading a status payload.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # A PolicyKit prompt sits inside a privileged run, so this has to allow for a
 # person finding their password. It exists only so that a prompt that never

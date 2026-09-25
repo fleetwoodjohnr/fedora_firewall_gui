@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Privileged helper for firewall-gui's Hardening page.
+"""Privileged helper for hardening changes and aggregate firewall activity.
 
 Runs as root via pkexec. It exists because three things the Hardening page needs
 have no unprivileged API at all: systemd-resolved's global settings, the
@@ -31,15 +31,17 @@ Design rules, all of them load-bearing:
     exists, so this can't lock anyone out.
 
 `status` is readable by anyone and is invoked directly, not through pkexec, so
-opening the Hardening page never prompts for a password. Only the four apply
-and revert verbs need root, and they share a single polkit action.
+opening the Hardening page never prompts for a password. Apply, revert, and the
+fixed aggregate activity read need root through a single polkit action.
 
-Verbs: status | apply-dns LEVEL | revert-dns | apply-crypto LEVEL | revert-crypto
+Verbs: status | activity | apply-dns LEVEL | revert-dns | apply-crypto LEVEL | revert-crypto
 """
 
 import json
+import datetime as dt
 import os
 import pwd
+import re
 import subprocess
 import sys
 import tempfile
@@ -47,7 +49,7 @@ import tempfile
 # Bumped whenever the status JSON or the verb set changes shape. The GUI checks
 # it and tells the user to reinstall the helper on a mismatch -- the app
 # auto-updates itself from git, but /usr/libexec needs sudo and will drift.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 RESOLVED_DROPIN = "/etc/systemd/resolved.conf.d/90-firewall-gui.conf"
 # Must sort before Fedora's 50-redhat.conf: sshd keeps the FIRST value it sees
@@ -407,6 +409,58 @@ def status():
     }
 
 
+def activity():
+    """Return a fixed 24-hour aggregate; never expose raw kernel log records."""
+    command = [
+        "journalctl", "--system", "_TRANSPORT=kernel", "--since=-24h",
+        "--lines=20000", "--output=json", "--no-pager",
+    ]
+    result = run(command)
+    if result.returncode:
+        fail(result.stderr.strip() or "could not read the kernel journal")
+    prefix = re.compile(
+        r"^(?:FINAL_REJECT|STATE_INVALID_DROP|rpfilter_DROP|RFC3964_IPv4_REJECT|"
+        r"filter_[A-Za-z0-9_-]+_(?:DROP|REJECT|ICMP_BLOCK)): "
+    )
+    port_pattern = re.compile(r"(?:^|\s)DPT=(\d{1,5})(?:\s|$)")
+    now = dt.datetime.now(dt.timezone.utc)
+    hourly = [0] * 24
+    ports = {}
+    total = 0
+    inspected = 0
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        inspected += 1
+        try:
+            record = json.loads(line)
+            message = record["MESSAGE"]
+            when = dt.datetime.fromtimestamp(int(record["__REALTIME_TIMESTAMP"]) / 1_000_000, dt.timezone.utc)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            continue
+        if not isinstance(message, str) or not prefix.match(message):
+            continue
+        age = (now - when).total_seconds()
+        if not 0 <= age < 24 * 3600:
+            continue
+        hourly[23 - int(age // 3600)] += 1
+        total += 1
+        match = port_pattern.search(message)
+        if match and 0 < int(match.group(1)) <= 65535:
+            key = match.group(1)
+            ports[key] = ports.get(key, 0) + 1
+    return {
+        "protocol": PROTOCOL_VERSION,
+        "activity": {
+            "total": total,
+            "hourly": hourly,
+            "top_ports": sorted(ports.items(), key=lambda item: (-item[1], int(item[0])))[:5],
+            "limited": inspected >= 20000,
+            "updated_at": now.isoformat(),
+        },
+    }
+
+
 # -- entry point -------------------------------------------------------------------
 
 def require_level(argv):
@@ -423,11 +477,13 @@ def require_level(argv):
 def main(argv):
     if len(argv) < 2:
         fail(f"usage: {os.path.basename(argv[0])} "
-             "status|apply-dns LEVEL|revert-dns|apply-crypto LEVEL|revert-crypto", 2)
+             "status|activity|apply-dns LEVEL|revert-dns|apply-crypto LEVEL|revert-crypto", 2)
 
     verb = argv[1]
-    if verb not in ("status", "apply-dns", "revert-dns", "apply-crypto", "revert-crypto"):
+    if verb not in ("status", "activity", "apply-dns", "revert-dns", "apply-crypto", "revert-crypto"):
         fail(f"unknown verb {verb!r}", 2)
+    if len(argv) != (3 if verb in ("apply-dns", "apply-crypto") else 2):
+        fail("unexpected arguments", 2)
 
     # Validate every argument before doing anything else, including before the
     # root check, so bad input is rejected identically whoever runs it.
@@ -440,6 +496,8 @@ def main(argv):
 
     if verb == "status":
         result = status()
+    elif verb == "activity":
+        result = activity()
     elif verb == "apply-dns":
         result = apply_dns(level)
     elif verb == "revert-dns":

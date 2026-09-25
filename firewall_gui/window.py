@@ -7,22 +7,28 @@ from gi.repository import Adw, Gtk
 from .backend.firewalld import FirewalldClient
 from .backend.hardening import HardeningClient
 from .backend.networkmanager import NetworkManagerClient
+from .backend.zone_assignment import ZoneAssignmentController
+from .backend.protonvpn import ProtonVpnClient
 from .backend.systemd import SystemdClient
 from .pages.dashboard import DashboardPage
 from .pages.hardening import HardeningPage
 from .pages.network_profiles import NetworkProfilesPage
+from .pages.proton_vpn import ProtonVpnPage
 from .pages.zone_editor import ZoneEditorPage
 from .settings import AppSettings
+from .widgets.pending import ApplyControls, PendingValue
 
 
 class FirewallGuiWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.set_default_size(760, 680)
+        self.set_default_size(980, 740)
         self.set_title("Firewall")
 
         self.firewalld = FirewalldClient()
         self.netmgr = NetworkManagerClient()
+        self.zone_assignments = ZoneAssignmentController(self.netmgr, self.firewalld)
+        self.proton = ProtonVpnClient(self.netmgr)
         self.hardening = HardeningClient()
         self.systemd = SystemdClient()
         self.settings = AppSettings()
@@ -54,11 +60,25 @@ class FirewallGuiWindow(Adw.ApplicationWindow):
             subtitle="Also list system and virtualization zones (libvirt, nm-shared, "
             "FedoraServer, etc.) in every zone picker.",
         )
-        switch_row.set_active(self.settings.show_all_zones)
-        switch_row.connect(
-            "notify::active",
-            lambda row, _pspec: setattr(self.settings, "show_all_zones", row.get_active()),
-        )
+        preference = PendingValue(self.settings.show_all_zones)
+        state = {"syncing": False}
+
+        def sync(model):
+            state["syncing"] = True
+            switch_row.set_active(bool(model.draft))
+            state["syncing"] = False
+
+        def changed(row, _pspec):
+            if not state["syncing"]:
+                preference.stage(row.get_active())
+
+        def apply(value, done):
+            ok, error = self.settings.apply("show_all_zones", value)
+            done(ok, error)
+
+        preference.connect(sync)
+        switch_row.connect("notify::active", changed)
+        switch_row.add_suffix(ApplyControls(preference, apply))
 
         group = Adw.PreferencesGroup()
         group.add(switch_row)
@@ -83,11 +103,16 @@ class FirewallGuiWindow(Adw.ApplicationWindow):
         view_stack = Adw.ViewStack(vexpand=True)
         self._view_switcher_title.set_stack(view_stack)
         switcher_bar = Adw.ViewSwitcherBar(stack=view_stack)
-        switcher_bar.set_reveal(True)
+        switcher_bar.set_reveal(self._view_switcher_title.get_title_visible())
+        self._view_switcher_title.connect(
+            "notify::title-visible",
+            lambda title, _pspec: switcher_bar.set_reveal(title.get_title_visible()),
+        )
 
-        dashboard = DashboardPage(self, self.firewalld, self.netmgr, self.settings)
+        dashboard = DashboardPage(self, self.firewalld, self.netmgr, self.settings, self.zone_assignments)
         zone_editor = ZoneEditorPage(self, self.firewalld, self.settings)
-        network_profiles = NetworkProfilesPage(self, self.firewalld, self.netmgr, self.settings)
+        network_profiles = NetworkProfilesPage(self, self.firewalld, self.netmgr, self.settings, self.zone_assignments)
+        proton_vpn = ProtonVpnPage(self, self.proton)
         hardening = HardeningPage(
             self, self.firewalld, self.netmgr, self.settings, self.hardening, self.systemd
         )
@@ -97,7 +122,11 @@ class FirewallGuiWindow(Adw.ApplicationWindow):
         view_stack.add_titled_with_icon(
             network_profiles, "network-profiles", "Network Profiles", "network-wireless-symbolic"
         )
+        view_stack.add_titled_with_icon(
+            proton_vpn, "proton-vpn", "Proton VPN", "network-vpn-symbolic"
+        )
         view_stack.add_titled_with_icon(hardening, "hardening", "Hardening", "channel-secure-symbolic")
+        view_stack.connect("notify::visible-child", lambda stack, _pspec: getattr(stack.get_visible_child(), "refresh", lambda: None)())
 
         content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         content_box.append(view_stack)
@@ -105,6 +134,7 @@ class FirewallGuiWindow(Adw.ApplicationWindow):
         self._toolbar_view.set_content(content_box)
 
         dashboard.refresh()
+        proton_vpn.refresh()
         hardening.refresh()
 
     def _show_connection_error(self, error):

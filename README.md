@@ -107,13 +107,20 @@ want to keep); use `make purge` instead to also remove that.
 
 ## Pages
 
-- **Dashboard** — what's connected right now and its firewall zone, a
-  temporary per-session zone override, a Panic Mode switch (blocks all
-  traffic), and editable hardening suggestions for your default zone.
+- **Dashboard** — current firewall coverage, active zones and allowed entries,
+  protection-layer status, optional logged-denial activity, active networks,
+  Panic Mode, and hardening suggestions. A zone change here is saved to its
+  NetworkManager profile and verified against the active firewall zone.
 - **Zone Editor** — pick any firewalld zone and toggle its services/ports,
   each with a plain-English explanation and risk note.
-- **Network Profiles** — assign a firewall zone to each saved WiFi/wired/VPN
-  connection, applied automatically whenever that network connects.
+- **Network Profiles** — search saved WiFi/wired/VPN connections and assign a
+  lasting firewall zone. Dashboard and Network Profiles show the same pending
+  choice and refresh together after Apply.
+- **Proton VPN** — diagnose the active tunnel, NetworkManager connectivity,
+  desktop-keyring metadata, and recent Proton connection events without reading
+  secrets. Retryable tunnel failures can be reconnected automatically; a full
+  Proton sign-in reset is offered only when an unresolved credential or
+  certificate failure is detected.
 - **Hardening** — two four-position switches, each explaining in plain English
   what a level turns on and what it might break.
   **DNS Hardening** goes from Fedora's plaintext default up to mandatory
@@ -128,3 +135,17 @@ want to keep); use `make purge` instead to also remove that.
   `disable --now`, authorized by systemd's own PolicyKit action, so it works
   with or without the helper) — on a laptop that never accepts remote logins,
   switching the server off beats any amount of hardening applied to it.
+
+Settings are staged until you click **Apply**. Each changed control shows its
+pending value, an Apply button, and a Discard button. The app reads back the
+result before saying Applied; a partial change stays visible with a Retry
+action. Pending choices remain when you switch pages.
+
+The Dashboard's denied-packet chart is optional and off by default. Enabling
+it sets firewalld's denied-unicast logging for the whole system and reloads the
+firewall rules. The chart summarizes the available kernel journal over the
+last 24 hours; it counts logged packets, not distinct attackers, and journal
+retention or rate limiting can reduce the count. If your account cannot read
+the system journal, the optional installed helper can provide aggregate totals
+on demand after administrator authentication. The app does not retain source
+addresses or a separate traffic history.

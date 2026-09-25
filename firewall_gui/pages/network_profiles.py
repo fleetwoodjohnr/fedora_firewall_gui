@@ -5,33 +5,40 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk
 
 from ..data.zones_catalog import filter_zones, get_zone_info, summarize_zone_settings
-from ..widgets.confirm import confirm, escape_markup, show_error_toast
+from ..widgets.confirm import escape_markup, show_error_toast, show_toast
+from ..widgets.pending import ApplyControls
+from ..widgets.page_intro import page_intro
 
 PHYSICAL_TYPES = {"802-11-wireless", "802-3-ethernet", "wifi", "ethernet"}
 
 
 class NetworkProfilesPage(Adw.PreferencesPage):
-    def __init__(self, window, firewalld, netmgr, settings):
+    def __init__(self, window, firewalld, netmgr, settings, zone_assignments):
         super().__init__(title="Network Profiles", icon_name="network-wireless-symbolic")
         self._window = window
         self._fw = firewalld
         self._nm = netmgr
         self._settings = settings
+        self._assignments = zone_assignments
         self._all_zones_raw = []
-        self._rows = []
         self._row_entries = {}
         self._default_zone = None
+
+        self.add(page_intro("Network profiles", "Set a lasting firewall zone for each saved Wi-Fi, wired, or VPN connection.", "network-wireless-symbolic"))
 
         self._intro_group = Adw.PreferencesGroup()
         self._intro_row = Adw.ActionRow(title="Loading…")
         self._intro_row.set_subtitle_lines(0)
         self._intro_group.add(self._intro_row)
+        self._search_entry = Gtk.SearchEntry()
+        self._search_entry.set_placeholder_text("Find a saved network…")
+        self._search_entry.connect("search-changed", lambda *_: self._filter_rows())
+        self._intro_group.add(self._search_entry)
         self.add(self._intro_group)
 
         self._physical_group = Adw.PreferencesGroup(
             title="Wi-Fi and Wired",
-            description="Assign a firewall zone to each saved network. It applies immediately if you're "
-            "connected to that network right now, or the next time you connect otherwise.",
+            description="Choose a zone, then Apply. Active connections update now; saved profiles use it again next time.",
         )
         self._vpn_group = Adw.PreferencesGroup(
             title="VPN and Virtual",
@@ -47,6 +54,12 @@ class NetworkProfilesPage(Adw.PreferencesPage):
         self._fw.get_zones(self._on_zones_loaded)
         self._fw.get_default_zone(self._on_default_zone_loaded)
         self._settings.connect("notify::show-all-zones", self._on_show_all_zones_changed)
+        self._assignments.connect("applied", self._on_assignment_applied)
+
+    def _on_assignment_applied(self, _controller, uuid, _zone):
+        entry = self._row_entries.get(uuid)
+        if entry is not None:
+            self._nm.get_connection_zone(uuid, entry["on_zone"])
 
     def _on_zones_loaded(self, zones, error):
         if error is not None or not zones:
@@ -74,15 +87,24 @@ class NetworkProfilesPage(Adw.PreferencesPage):
         self._nm.list_connections(self._on_connections_loaded)
 
     def _on_connections_loaded(self, connections, error):
-        for group, row in self._rows:
-            group.remove(row)
-        self._rows.clear()
-        self._row_entries.clear()
         if error is not None:
             show_error_toast(self._window.toast_overlay, error, "Couldn't list saved networks")
             return
+        seen = {c["uuid"] for c in connections or [] if c["type"] != "loopback"}
+        for uuid in list(self._row_entries):
+            if uuid not in seen:
+                entry = self._row_entries.pop(uuid)
+                entry["model"].disconnect(entry["model_listener"])
+                entry["controls"].detach()
+                entry["group"].remove(entry["row"])
         for conn in connections or []:
             if conn["type"] == "loopback":
+                continue
+            if conn["uuid"] in self._row_entries:
+                entry = self._row_entries[conn["uuid"]]
+                entry["conn"] = conn
+                entry["row"].set_title(escape_markup(conn["name"]))
+                self._nm.get_connection_zone(conn["uuid"], entry["on_zone"])
                 continue
             if self._nm.is_vpn_like(conn["type"]):
                 group = self._vpn_group
@@ -92,24 +114,47 @@ class NetworkProfilesPage(Adw.PreferencesPage):
                 group = self._other_group
                 self._other_group.set_visible(True)
             self._add_connection_row(group, conn)
+        self._filter_rows()
+
+    def _filter_rows(self):
+        query = self._search_entry.get_text().strip().casefold()
+        counts = {self._physical_group: 0, self._vpn_group: 0, self._other_group: 0}
+        for entry in self._row_entries.values():
+            conn = entry["conn"]
+            matches = query in (conn["name"] + " " + conn["type"] + " " + conn["device"]).casefold()
+            entry["row"].set_visible(matches)
+            counts[entry["group"]] += int(matches)
+        for group, count in counts.items():
+            group.set_visible(bool(count))
 
     def _add_connection_row(self, group, conn):
         name = escape_markup(conn["name"])
-        base_subtitle = escape_markup(f"{conn['type']} • {conn['device'] or 'not connected'}")
-        row = Adw.ComboRow(title=name, subtitle=base_subtitle)
+        row = Adw.ComboRow(title=name)
         row.set_subtitle_lines(2)
         group.add(row)
-        self._rows.append((group, row))
 
-        entry = {"row": row, "displayed_zones": [], "state": {"syncing": True, "index": 0}, "effective_zone": None}
+        model = self._assignments.model_for(conn["uuid"])
+        entry = {"row": row, "group": group, "conn": conn, "model": model,
+                 "displayed_zones": [], "state": {"syncing": True},
+                 "effective_zone": None, "was_unset": False}
         self._row_entries[conn["uuid"]] = entry
+        controls = ApplyControls(model, lambda zone, done: self._apply_zone(conn["uuid"], zone, done))
+        entry["controls"] = controls
+        row.add_suffix(controls)
+
+        def base_subtitle():
+            current = entry["conn"]
+            return escape_markup(
+                f"{current['type']} • "
+                f"{'active on ' + current['device'] if current['device'] else 'saved for next connection'}"
+            )
 
         def describe(zone, was_unset):
             info = get_zone_info(zone)
             if was_unset:
-                row.set_subtitle(f"{base_subtitle} • no zone set — currently using “{zone}” ({info.trust_label})")
+                row.set_subtitle(f"{base_subtitle()} • no zone set — currently using “{zone}” ({info.trust_label})")
             else:
-                row.set_subtitle(f"{base_subtitle} • {zone} — {info.trust_label}")
+                row.set_subtitle(f"{base_subtitle()} • {zone} — {info.trust_label}")
             row.set_tooltip_text(info.guidance)
 
             def on_settings(settings, error):
@@ -121,15 +166,9 @@ class NetworkProfilesPage(Adw.PreferencesPage):
 
         def apply_effective_zone(effective_zone, was_unset):
             entry["effective_zone"] = effective_zone
-            displayed = filter_zones(self._all_zones_raw, self._settings.show_all_zones, must_keep=effective_zone)
-            entry["displayed_zones"] = displayed
-            index = displayed.index(effective_zone) if effective_zone in displayed else 0
-            state = entry["state"]
-            state["syncing"] = True
-            row.set_model(Gtk.StringList.new(displayed))
-            row.set_selected(index)
-            state["index"] = index
-            state["syncing"] = False
+            entry["was_unset"] = was_unset
+            self._assignments.observe(conn["uuid"], effective_zone)
+            self._rebuild_row_zone_model(entry)
             describe(effective_zone, was_unset)
 
         def on_selected(r, _pspec):
@@ -137,54 +176,50 @@ class NetworkProfilesPage(Adw.PreferencesPage):
             if state["syncing"]:
                 return
             new_index = r.get_selected()
-            new_zone = entry["displayed_zones"][new_index]
-            state["syncing"] = True
-            r.set_selected(state["index"])
-            state["syncing"] = False
-
-            def apply():
-                def on_result(ok, error2):
-                    if ok:
-                        apply_effective_zone(new_zone, was_unset=False)
-                    elif error2 is not None:
-                        show_error_toast(self._window.toast_overlay, error2, "Couldn't assign zone")
-
-                self._nm.set_connection_zone(conn["uuid"], new_zone, on_result)
-
-            confirm(
-                self._window,
-                f"Assign “{new_zone}” to {name}?",
-                f"Whenever this laptop connects to {name}, firewalld will automatically switch "
-                f"to the “{new_zone}” zone.\n\n{get_zone_info(new_zone).guidance}",
-                "Assign Zone",
-                apply,
-                destructive=False,
-            )
+            if 0 <= new_index < len(entry["displayed_zones"]):
+                model.stage(entry["displayed_zones"][new_index])
 
         row.connect("notify::selected", on_selected)
+        entry["model_listener"] = model.connect(lambda _model: self._rebuild_row_zone_model(entry))
 
         def on_zone(zone, error):
+            if self._row_entries.get(conn["uuid"]) is not entry:
+                return
             if error is not None:
-                row.set_subtitle(f"{base_subtitle} • couldn't read assigned zone")
+                row.set_subtitle(f"{base_subtitle()} • couldn't read assigned zone")
                 return
             effective_zone = zone or self._default_zone or "public"
             apply_effective_zone(effective_zone, was_unset=not zone)
 
+        entry["on_zone"] = on_zone
         self._nm.get_connection_zone(conn["uuid"], on_zone)
+
+    def _apply_zone(self, uuid, zone, done):
+        def on_result(ok, error):
+            if ok:
+                show_toast(self._window.toast_overlay, f"Zone {zone} applied to the network profile.")
+            else:
+                show_error_toast(self._window.toast_overlay, error, "Couldn't fully apply zone")
+            done(ok, error)
+
+        self._assignments.apply(uuid, zone, on_result)
 
     def _on_show_all_zones_changed(self, *_args):
         for entry in self._row_entries.values():
             self._rebuild_row_zone_model(entry)
 
     def _rebuild_row_zone_model(self, entry):
-        effective_zone = entry["effective_zone"]
-        if effective_zone is None:
+        effective_zone = entry["model"].draft or entry["effective_zone"]
+        if effective_zone is None or not self._all_zones_raw:
             return
         displayed = filter_zones(self._all_zones_raw, self._settings.show_all_zones, must_keep=effective_zone)
+        current = entry["model"].applied
+        if current in self._all_zones_raw and current not in displayed:
+            displayed.append(current)
+            displayed.sort()
         entry["displayed_zones"] = displayed
         index = displayed.index(effective_zone) if effective_zone in displayed else 0
         entry["state"]["syncing"] = True
         entry["row"].set_model(Gtk.StringList.new(displayed))
         entry["row"].set_selected(index)
         entry["state"]["syncing"] = False
-        entry["state"]["index"] = index

@@ -9,6 +9,8 @@ from ..data.zones_catalog import filter_zones, get_zone_info, summarize_zone_set
 from ..widgets.debounce import Debouncer
 from ..widgets.confirm import confirm, show_error_toast
 from ..widgets.service_row import ServiceRow
+from ..widgets.pending import ApplyControls, PendingValue
+from ..widgets.page_intro import page_intro
 
 CHIP_COMMON = "common"
 CHIP_REMOTE = "remote"
@@ -30,6 +32,11 @@ class ZoneEditorPage(Adw.PreferencesPage):
         self._all_service_names = []
         self._chip_filter = CHIP_COMMON
         self._port_rows = []
+        self._load_generation = 0
+        self._service_models = {}
+        self._port_models = {}
+
+        self.add(page_intro("Zone editor", "Review what each zone allows, then stage and apply individual changes.", "preferences-system-symbolic"))
 
         self._build_header_group()
         self._build_services_group()
@@ -155,12 +162,17 @@ class ZoneEditorPage(Adw.PreferencesPage):
         child = self._services_list.get_first_child()
         while child is not None:
             nxt = child.get_next_sibling()
+            if isinstance(child, ServiceRow):
+                child.detach()
             self._services_list.remove(child)
             child = nxt
         for name in self._all_service_names:
             info = get_service_info(name)
             on_expand = self._make_lazy_expand(name) if info.category == "Other" else None
-            row = ServiceRow(name, info, name in enabled, self._on_service_toggle, self._on_service_error, on_expand)
+            key = (self._current_zone, name)
+            model = self._service_models.setdefault(key, PendingValue(name in enabled))
+            row = ServiceRow(name, info, name in enabled, self._on_service_toggle,
+                             self._on_service_error, on_expand, model=model)
             self._services_list.append(row)
         self._services_list.invalidate_filter()
 
@@ -179,10 +191,34 @@ class ZoneEditorPage(Adw.PreferencesPage):
     def _on_service_toggle(self, name, enabled, backend_callback):
         if self._current_zone is None:
             return
+        zone = self._current_zone
+
+        def written(ok, error, partial):
+            if not ok or partial:
+                backend_callback(False, error, partial)
+                return
+            self._verify_zone_item(zone, "services", name, enabled, backend_callback)
+
         if enabled:
-            self._fw.add_service(self._current_zone, name, backend_callback)
+            self._fw.add_service(zone, name, written)
         else:
-            self._fw.remove_service(self._current_zone, name, backend_callback)
+            self._fw.remove_service(zone, name, written)
+
+    def _verify_zone_item(self, zone, key, item, expected, callback):
+        """A setting is applied only when runtime and permanent state agree."""
+        state = {"remaining": 2, "errors": []}
+
+        def one(settings, error):
+            if error or settings is None:
+                state["errors"].append(str(error or "settings unavailable"))
+            elif (item in (settings.get(key) or [])) != expected:
+                state["errors"].append("readback did not match the requested value")
+            state["remaining"] -= 1
+            if not state["remaining"]:
+                callback(not state["errors"], "; ".join(state["errors"]) or None, bool(state["errors"]))
+
+        self._fw.get_zone_settings(zone, one)
+        self._fw.get_permanent_zone_settings(zone, one)
 
     def _on_service_error(self, name, requested_state, error, partial):
         if error is not None:
@@ -211,28 +247,54 @@ class ZoneEditorPage(Adw.PreferencesPage):
 
     def _populate_custom_ports(self, settings):
         for row in self._port_rows:
+            if hasattr(row, "_apply_controls"):
+                row._apply_controls.detach()
             self._ports_group.remove(row)
         self._port_rows.clear()
         for port, protocol in settings.get("ports", []):
-            row = Adw.ActionRow(title=f"{port} / {protocol}")
-            remove_btn = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
-            remove_btn.add_css_class("flat")
-            remove_btn.connect("clicked", lambda b, p=port, proto=protocol: self._on_remove_port(p, proto))
-            row.add_suffix(remove_btn)
-            self._ports_group.add(row)
-            self._port_rows.append(row)
+            self._add_port_control(port, protocol)
+
+    def _add_port_control(self, port, protocol):
+        zone = self._current_zone
+        key = (zone, port, protocol)
+        model = self._port_models.setdefault(key, PendingValue(True))
+        model.observe(True)
+        row = Adw.ActionRow(title=f"{port} / {protocol}", subtitle="Open in this zone")
+        remove_btn = Gtk.Button(label="Close", valign=Gtk.Align.CENTER)
+        remove_btn.add_css_class("flat")
+        remove_btn.connect("clicked", lambda *_: model.stage(False))
+        row.add_suffix(remove_btn)
+        controls = ApplyControls(model, lambda wanted, done: self._apply_port(zone, port, protocol, wanted, done))
+        row._apply_controls = controls
+        row.add_suffix(controls)
+        self._ports_group.add(row)
+        self._port_rows.append(row)
+
+    def _apply_port(self, zone, port, protocol, wanted, done):
+        def written(ok, error, partial):
+            if not ok or partial:
+                done(False, error or "runtime and saved rules differ")
+                return
+            self._verify_zone_item(
+                zone, "ports", (port, protocol), wanted,
+                lambda verified, reason, _partial: self._port_verified(zone, verified, reason, done),
+            )
+
+        action = self._fw.add_port if wanted else self._fw.remove_port
+        action(zone, port, protocol, written)
+
+    def _port_verified(self, zone, ok, error, done):
+        done(ok, error)
+        if ok and self._current_zone == zone:
+            self._load_zone(zone)
 
     def _on_remove_port(self, port, protocol):
-        if self._current_zone is None:
-            return
-
-        def on_result(ok, error, partial):
-            if not ok and error is not None:
-                show_error_toast(self._window.toast_overlay, error, "Couldn't remove port")
-
-        self._fw.remove_port(self._current_zone, port, protocol, on_result)
+        model = self._port_models.get((self._current_zone, port, protocol))
+        if model:
+            model.stage(False)
 
     def _on_add_port_activated(self, row):
+        zone = self._current_zone
         dialog = Adw.Dialog(title="Add a Custom Port", content_width=420)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         box.set_margin_top(18)
@@ -261,7 +323,7 @@ class ZoneEditorPage(Adw.PreferencesPage):
         button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, halign=Gtk.Align.END)
         cancel_btn = Gtk.Button(label="Cancel")
         cancel_btn.connect("clicked", lambda b: dialog.close())
-        add_btn = Gtk.Button(label="Add Port")
+        add_btn = Gtk.Button(label="Apply Port")
         add_btn.add_css_class("suggested-action")
 
         def on_add(button):
@@ -269,21 +331,24 @@ class ZoneEditorPage(Adw.PreferencesPage):
             protocol = ["tcp", "udp"][protocol_dropdown.get_selected()]
             if not port:
                 return
-            dialog.close()
-
             def apply():
-                def on_result(ok, error, partial):
-                    if not ok and error is not None:
-                        show_error_toast(self._window.toast_overlay, error, "Couldn't add port")
+                add_btn.set_sensitive(False)
 
-                self._fw.add_port(self._current_zone, port, protocol, on_result)
+                def finished(ok, error):
+                    add_btn.set_sensitive(True)
+                    if ok:
+                        dialog.close()
+                    else:
+                        show_error_toast(self._window.toast_overlay, error, "Couldn't apply port")
+
+                self._apply_port(zone, port, protocol, True, finished)
 
             confirm(
                 self._window,
                 f"Open port {port}/{protocol}?",
                 f"This will accept incoming {protocol.upper()} connections on port {port} from any device on "
-                f"a network using the “{self._current_zone}” zone.",
-                "Open Port",
+                f"a network using the “{zone}” zone.",
+                "Apply Port",
                 apply,
                 destructive=False,
             )
@@ -333,8 +398,12 @@ class ZoneEditorPage(Adw.PreferencesPage):
 
     def _load_zone(self, zone):
         self._current_zone = zone
+        self._load_generation += 1
+        generation = self._load_generation
 
         def on_settings(settings, error):
+            if generation != self._load_generation:
+                return
             if error is not None or settings is None:
                 show_error_toast(self._window.toast_overlay, error or "unknown error", "Couldn't load zone")
                 return
